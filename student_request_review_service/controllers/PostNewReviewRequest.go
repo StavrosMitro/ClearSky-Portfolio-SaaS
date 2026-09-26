@@ -47,12 +47,7 @@ func PostNewReviewRequest(body map[string]interface{}) (string, error) {
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil || rowsAffected == 0 {
-		failResponse := map[string]interface{}{
-			"error":   "Insert failed",
-			"message": "Failed to insert review on student end.",
-		}
-		failRespBytes, _ := json.Marshal(failResponse)
-		return string(failRespBytes), nil
+		return "", fmt.Errorf("failed to insert review")
 	}
 
 	// Return success response

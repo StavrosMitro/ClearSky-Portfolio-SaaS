@@ -34,13 +34,20 @@
       <% if (error) { %>
         <p style="color:#c00;margin-top:1rem;"><%= error %></p>
       <% } %>
+      <% if (typeof notice !== 'undefined' && notice) { %>
+        <p role="status" style="color:#006400;margin-top:1rem;"><%= notice %></p>
+      <% } %>
 
       <!-- GOOGLE LOGIN BUTTON -->
       <a id="google-login-btn" class="button button--secondary"
-         href="http://localhost:8086/auth/google/login"
+         href="/auth/google/login"
          style="margin-top:0.75rem;display:inline-block;">
         Login with&nbsp;Google
       </a>
+
+      <p style="margin-top:1rem;">
+        New student? <a href="/signup">Create your account</a>.
+      </p>
     </fieldset>
   </main>
 

@@ -14,28 +14,19 @@ form.addEventListener('submit', async e => {
   // ──────────────────────────────────────────────────────────────
   const input    = form.username.value.trim();
   const password = form.password.value;
-  const isEmail  = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input);
-  const payload  = isEmail
-    ? { email: input, password }
-    : { username: input, password };
+  // Email addresses are valid usernames; the API uses one canonical field.
+  const payload = { username: input, password };
 
   try {
     // ────────────────────────────────────────────────────────────
-    // 2) Ask orchestrator to log us in → { role, token }
+    // 2) Ask orchestrator to log us in. The token stays in an HttpOnly cookie.
     // ────────────────────────────────────────────────────────────
-    const { role, token } = await loginUser(payload);
-
-    // 3) Persist JWT so every future fetch() carries Authorization: Bearer …
-    localStorage.setItem('jwt', token);
+    const { role } = await loginUser(payload);
 
     // 4) Tell the Express layer to remember who we are (for EJS templates)
     await fetch('/api/session', {
       method : 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body   : JSON.stringify({
-        username: input,
-        role
-      })
+      credentials: 'same-origin'
     });
 
     // ────────────────────────────────────────────────────────────

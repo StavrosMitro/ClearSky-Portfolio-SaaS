@@ -15,33 +15,34 @@ type AddInstitutionReq struct {
 
 func AddInstitutionHandler(d amqp.Delivery, ch *amqp.Channel) {
 	var req AddInstitutionReq
-	var res Response
+	var res RPCEnvelope
 
 	defer d.Ack(false)
 	Credits := 10
 	// Parse request JSON
 	if err := json.Unmarshal(d.Body, &req); err != nil {
-		res.Status = "error"
-		res.Message = "Invalid JSON in request"
-		res.Err = nil
+		res = rpcFailure("INVALID_REQUEST", "A valid institution request is required", false)
+		publishReply(ch, d, res)
+		return
+	}
+	if req.Name == "" {
+		res = rpcFailure("INVALID_REQUEST", "Institution name is required", false)
 		publishReply(ch, d, res)
 		return
 	}
 
 	success, err := dbService.NewInstitution(req.Name, Credits)
 	if err != nil {
-		res.Status = "error"
-		res.Message = "Could not add institution"
-		res.Err = err
+		res = rpcFailure("DEPENDENCY_UNAVAILABLE", "Credits store is unavailable", true)
 		publishReply(ch, d, res)
 		return
 	}
 
 	if success {
-		res.Status = "OK"
-		res.Message = "Institution added successfully"
-		res.Err = nil
+		res = rpcSuccess(map[string]string{"message": "Institution added successfully"})
 		publishReply(ch, d, res)
 		return
 	}
+	res = rpcFailure("CONFLICT", "Institution already exists", false)
+	publishReply(ch, d, res)
 }

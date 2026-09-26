@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include('partials/head', { title: 'Confirm your student ID' }) %>
+</head>
+<body>
+  <%- include('partials/navbar') %>
+
+  <main class="login-container">
+    <fieldset>
+      <legend>Confirm your student ID</legend>
+
+      <p>
+        Your university Google account is verified. This is your first sign-in,
+        so enter your student ID to finish creating your account.
+      </p>
+
+      <form id="google-signup-form" novalidate>
+        <div class="form-group">
+          <label for="student_id">Student ID</label>
+          <input id="student_id" name="student_id" required autocomplete="off"
+                 placeholder="e.g. 03121001" />
+        </div>
+
+        <button class="button" type="submit">Finish sign-up</button>
+
+        <p id="google-signup-status" role="status" style="display:none;margin-top:1rem;color:#c00;"></p>
+      </form>
+    </fieldset>
+  </main>
+
+  <script type="module" src="/js/auth/google-signup.js"></script>
+</body>
+</html>

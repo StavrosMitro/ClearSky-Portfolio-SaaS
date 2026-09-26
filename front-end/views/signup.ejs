@@ -1,40 +1,43 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <%- include('partials/head', { title: 'Sign up' }) %>
+  <%- include('partials/head', { title: 'Student sign-up' }) %>
 </head>
 <body>
   <%- include('partials/navbar') %>
 
   <main class="login-container">
     <fieldset>
-      <legend>Create account</legend>
+      <legend>Student sign-up</legend>
+
+      <p>
+        Enter your student ID and university email exactly as the secretariat
+        registered them. We will email you a link to confirm your address and
+        choose a password.
+      </p>
 
       <form id="signup-form" novalidate>
         <div class="form-group">
-          <label>E-mail</label>
-          <input name="email" type="email" required />
+          <label for="student_id">Student ID</label>
+          <input id="student_id" name="student_id" required autocomplete="off"
+                 inputmode="text" placeholder="e.g. 03121001" />
         </div>
 
         <div class="form-group">
-          <label>Password</label>
-          <input name="password" type="password" required />
+          <label for="email">University e-mail</label>
+          <input id="email" name="email" type="email" required autocomplete="email" />
         </div>
 
-        <div class="form-group">
-          <label>Role</label>
-          <select name="role">
-            <option value="student">Student</option>
-            <option value="instructor">Instructor</option>
-            <option value="institution_representative">
-              Institution representative
-            </option>
-          </select>
-        </div>
-
-        <button class="button" type="submit">Sign up</button>
+        <button class="button" type="submit">Send confirmation email</button>
         <a class="button button--secondary" href="/login">Back to log-in</a>
+
+        <p id="signup-status" role="status" style="display:none;margin-top:1rem;"></p>
       </form>
+
+      <p style="margin-top:1rem;">
+        Have a university Google account?
+        <a href="/auth/google/login">Sign up with Google</a> instead.
+      </p>
     </fieldset>
   </main>
 

@@ -7,12 +7,13 @@ services:
     image: rabbitmq:3-management
     restart: always
     container_name: clearSky-rabbitmq
-    ports:
-      - "5673:5672"    # AMQP port
-      - "15673:15672"  # Management UI
+    # Internal only: no host ports. Services reach it as rabbitmq:5672 on
+    # clearSky-net. For the management UI see docs/auth-cutover.md.
+    expose:
+      - "5672"
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?RABBITMQ_DEFAULT_USER must be set}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?RABBITMQ_DEFAULT_PASS must be set}
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -32,7 +33,14 @@ services:
     depends_on:
       - rabbitmq
     environment:
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - AMQP_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set}
+      - JWT_ISSUER=${JWT_ISSUER:-clearsky-identity}
+      - JWT_AUDIENCE=${JWT_AUDIENCE:-clearsky-api}
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      - RABBITMQ_MAX_IN_FLIGHT=${RABBITMQ_MAX_IN_FLIGHT:-64}
+      - RABBITMQ_REQUEST_TIMEOUT=${RABBITMQ_REQUEST_TIMEOUT:-10s}
     networks:
       - clearSky-net
 
@@ -62,7 +70,7 @@ services:
       - rabbitmq
       - student_db
     environment:
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - AMQP_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       - DATABASE_URL=postgres://postgres:root@student_db:5432/reviewsdb?sslmode=disable
     networks:
       - clearSky-net
@@ -93,7 +101,7 @@ services:
       - rabbitmq
       - instructor_db
     environment:
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - AMQP_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       - DATABASE_URL=postgres://postgres:root@instructor_db:5432/reviewsdbinst?sslmode=disable
     networks:
       - clearSky-net
@@ -126,6 +134,9 @@ services:
       - credits_db
       - rabbitmq
     env_file: ./credits_service/.env
+    environment:
+      # Overrides the development broker URL in the service's .env file.
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
     ports:
       - "8081:8080"
     networks:
@@ -143,11 +154,14 @@ services:
     depends_on:
       - rabbitmq
     environment:
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
       - GOOGLE_REDIRECT_URL=http://localhost:8086/auth/google/callback
-      - JWT_SECRET=${JWT_SECRET:-default-secret-key}
+      - INTERNAL_AUTH_TOKEN=${INTERNAL_AUTH_TOKEN:?INTERNAL_AUTH_TOKEN must be set}
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
+      - GOOGLE_ALLOWED_DOMAINS=${GOOGLE_ALLOWED_DOMAINS:-}
+      - GOOGLE_REQUIRE_WORKSPACE=${GOOGLE_REQUIRE_WORKSPACE:-true}
       - UMS_URL=http://user_management_service:8082
       - FRONTEND_URL=http://localhost:3000
     networks:
@@ -165,6 +179,8 @@ services:
       - GO_API_URL=http://orchestrator:8080
       - GOOGLE_AUTH_URL=http://google_auth_service:8086
       - GOOGLE_AUTH_EXTERNAL_URL=http://localhost:8086
+      - SESSION_SECRET=${SESSION_SECRET:?SESSION_SECRET must be set}
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
     networks:
       - clearSky-net
     
@@ -176,12 +192,40 @@ services:
       dockerfile: Dockerfile
     container_name: user_management_service
     restart: always
-    ports:
-      - "8082:8082"
+    # Internal only: the orchestrator is the public API boundary.
+    expose:
+      - "8082"
     depends_on:
       - rabbitmq
+      - mailpit
     environment:
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set}
+      - JWT_ISSUER=${JWT_ISSUER:-clearsky-identity}
+      - JWT_AUDIENCE=${JWT_AUDIENCE:-clearsky-api}
+      - INTERNAL_AUTH_TOKEN=${INTERNAL_AUTH_TOKEN:?INTERNAL_AUTH_TOKEN must be set}
+      - BOOTSTRAP_ADMIN_USERNAME=${BOOTSTRAP_ADMIN_USERNAME:-}
+      - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-}
+      # Account emails. Defaults deliver to the local Mailpit inbox; set a real
+      # SMTP relay for any shared deployment.
+      - SMTP_HOST=${SMTP_HOST:-mailpit}
+      - SMTP_PORT=${SMTP_PORT:-1025}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - "SMTP_FROM=${SMTP_FROM:-ClearSky <no-reply@clearsky.local>}"
+      - PUBLIC_APP_URL=${PUBLIC_APP_URL:-http://localhost:3000}
+    networks:
+      - clearSky-net
+
+  # DEVELOPMENT MAIL CATCHER: shows every email user management sends.
+  # Web inbox on http://127.0.0.1:8025 (loopback only); SMTP stays internal.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: always
+    ports:
+      - "127.0.0.1:8025:8025"
+    expose:
+      - "1025"
     networks:
       - clearSky-net
 
@@ -216,11 +260,11 @@ services:
       - rabbitmq
       - initial_grades_db
     environment:
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - AMQP_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       - DATABASE_URL=mongodb://initial_grades_db:27017/init_grades
       - MONGO_URI=mongodb://initial_grades_db:27017/init_grades
-      - RABBITMQ_URI=amqp://rabbitmq:5672
-      - RABBITMQ_EXCHANGE=clearSky.events
+      - RABBITMQ_URI=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      - RABBITMQ_EXCHANGE=clearsky.commands.v1
       - RABBITMQ_ROUTING_KEY=postgrades.init
       - RABBITMQ_CREDIT_INCR_KEY=incr.credits
       - MONGO_USER=root
@@ -264,12 +308,12 @@ services:
       - rabbitmq
       - final_grades_db
     environment:
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - AMQP_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       - DATABASE_URL=mongodb://final_grades_db:27017/final_grades
       - NODE_ENV=production
       - MONGO_URI=mongodb://final_grades_db:27017/final_grades
-      - RABBITMQ_URI=amqp://rabbitmq:5672
-      - RABBITMQ_EXCHANGE=clearSky.events
+      - RABBITMQ_URI=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      - RABBITMQ_EXCHANGE=clearsky.commands.v1
       - RABBITMQ_ROUTING_KEY=postgrades.final
       - RABBITMQ_CREDIT_INCR_KEY=incr.credits
     networks:
@@ -308,11 +352,11 @@ services:
       - stats_db
       - rabbitmq
     environment:
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - AMQP_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       - DATABASE_URL=mysql://user:password@stats_db:3306/stats
       - MYSQL_URI=mysql://user:password@stats_db:3306/stats
-      - RABBITMQ_URI=amqp://rabbitmq:5672
-      - RABBITMQ_EXCHANGE=clearSky.events
+      - RABBITMQ_URI=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      - RABBITMQ_EXCHANGE=clearsky.commands.v1
       - RABBITMQ_ROUTING_KEY=postgrades.statistics
       - RABBITMQ_GET_GRADES_KEY=stats.get
       - RABBITMQ_SEND_AVAIL_KEY=stats.avail
@@ -348,11 +392,11 @@ services:
       - view_grades_db
       - rabbitmq
     environment:
-      - RABBITMQ_URI=amqp://rabbitmq:5672
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - RABBITMQ_URI=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      - AMQP_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       - DATABASE_URL=mysql://user:password@view_grades_db:3306/view_grades
       - MYSQL_URI=mysql://user:password@view_grades_db:3306/view_grades
-      - RABBITMQ_EXCHANGE=clearSky.events
+      - RABBITMQ_EXCHANGE=clearsky.commands.v1
       - RABBITMQ_ROUTING_KEY=postgrades.view
       - RABBITMQ_GET_GRADES_KEY=view.avail
     networks:
@@ -386,6 +430,9 @@ services:
       - reg_db
       - rabbitmq
     env_file: ./registration_service/.env
+    environment:
+      # Overrides the development broker URL in the service's .env file.
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
     ports:
       - "8083:8080"
     networks:
@@ -404,4 +451,3 @@ volumes:
   stats_db_data:
   view_db_data:
   reg_pgdata:
-

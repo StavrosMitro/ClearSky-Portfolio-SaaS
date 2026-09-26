@@ -34,12 +34,13 @@ func main() {
 	replyQueue, _ := ch.QueueDeclare("", false, true, true, false, nil)
 
 	err = ch.Publish(
-		"orchestrator.commands", // exchange
-		"auth.register",         // <-- change from "auth.login" to "auth.register"
+		"clearsky.commands.v1", // exchange
+		"auth.request",         // <-- change from "auth.login" to "auth.request"
 		false,
 		false,
 		amqp.Publishing{
 			ContentType:   "application/json",
+			DeliveryMode:  amqp.Persistent,
 			CorrelationId: corrID,
 			ReplyTo:       replyQueue.Name,
 			Body:          body,

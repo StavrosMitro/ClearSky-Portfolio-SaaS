@@ -25,20 +25,11 @@ func Connect() {
 	}
 
 	if err := ch.ExchangeDeclare(
-		"clearsky.events", "topic", true, false, false, false, nil,
+		"clearsky.events.v1", "topic", true, false, false, false, nil,
 	); err != nil {
 		log.Fatalf("Declare clearsky.events: %v", err)
 	}
 
-	queue := "google_auth.request"
-	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
-		log.Fatalf("QueueDeclare %s: %v", queue, err)
-	}
-	if err := ch.QueueBind(
-		queue, "user.login.google", "clearsky.events", false, nil,
-	); err != nil {
-		log.Fatalf("QueueBind user.login.google: %v", err)
-	}
 }
 
 func PublishLoginEvent(email string) {
@@ -50,13 +41,14 @@ func PublishLoginEvent(email string) {
 	body := `{"event":"user_logged_in","email":"` + email + `"}`
 
 	err := ch.Publish(
-		"clearsky.events", // exchange
-		"",                // routing key (fanout)
+		"clearsky.events.v1",
+		"user.login.google",
 		false,
 		false,
 		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        []byte(body),
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Body:         []byte(body),
 		},
 	)
 	if err != nil {

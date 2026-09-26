@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include('partials/head', { title: 'Choose your password' }) %>
+</head>
+<body>
+  <%- include('partials/navbar') %>
+
+  <main class="login-container">
+    <fieldset>
+      <legend>Choose your password</legend>
+
+      <form id="activate-form" novalidate>
+        <div class="form-group">
+          <label for="password">New password</label>
+          <input id="password" name="password" type="password" required
+                 minlength="8" autocomplete="new-password" />
+        </div>
+
+        <div class="form-group">
+          <label for="confirm">Repeat password</label>
+          <input id="confirm" name="confirm" type="password" required
+                 minlength="8" autocomplete="new-password" />
+        </div>
+
+        <button class="button" type="submit">Save password</button>
+
+        <p id="activate-status" role="status" style="display:none;margin-top:1rem;"></p>
+      </form>
+    </fieldset>
+  </main>
+
+  <script type="module" src="/js/auth/activate.js"></script>
+</body>
+</html>

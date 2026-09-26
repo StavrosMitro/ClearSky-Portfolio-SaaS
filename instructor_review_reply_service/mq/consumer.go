@@ -1,12 +1,47 @@
 package mq
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"instructor_review_reply_service/routes"
 
 	"github.com/streadway/amqp"
 )
+
+type rpcError struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Retryable bool   `json:"retryable"`
+}
+
+type rpcEnvelope struct {
+	Version int             `json:"version"`
+	Data    json.RawMessage `json:"data,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+func encodeRPCResponse(response string, routeErr error) []byte {
+	envelope := rpcEnvelope{Version: 1}
+	if routeErr != nil {
+		message := strings.ToLower(routeErr.Error())
+		switch {
+		case strings.Contains(message, "not found"):
+			envelope.Error = &rpcError{Code: "NOT_FOUND", Message: "Review was not found"}
+		case strings.Contains(message, "missing"), strings.Contains(message, "invalid"), strings.Contains(message, "parse"), strings.Contains(message, "unknown routing"):
+			envelope.Error = &rpcError{Code: "INVALID_REQUEST", Message: "Invalid review request"}
+		default:
+			envelope.Error = &rpcError{Code: "DEPENDENCY_UNAVAILABLE", Message: "Review store is unavailable", Retryable: true}
+		}
+	} else if json.Valid([]byte(response)) {
+		envelope.Data = json.RawMessage(response)
+	} else {
+		envelope.Error = &rpcError{Code: "INTERNAL_ERROR", Message: "Review service returned invalid data"}
+	}
+	body, _ := json.Marshal(envelope)
+	return body
+}
 
 // function to handle errors
 func errorHandling(err error, msg string) {
@@ -18,7 +53,7 @@ func errorHandling(err error, msg string) {
 func StartConsumer() {
 
 	// keys for instructor events
-	exchangeKey := "clearSky.events"
+	exchangeKey := "clearsky.commands.v1"
 	routingKeysinstructor := []string{
 		"instructor.postResponse",
 		"instructor.getRequestsList",
@@ -39,16 +74,24 @@ func StartConsumer() {
 	)
 	errorHandling(err, "Failed to declare exchange")
 
+	err = Mqch.ExchangeDeclare("clearsky.dlx.v1", "direct", true, false, false, false, nil)
+	errorHandling(err, "Failed to declare dead-letter exchange")
+
 	// declare a durable queue
 	queue, err := Mqch.QueueDeclare(
-		"instructor_queue", // queue name
-		true,               // durable
-		false,              // delete when unused
-		false,              // not exclusive
-		false,              // no-wait
-		nil,
+		"clearsky.instructor-review.commands.v1", // queue name
+		true,                                     // durable
+		false,                                    // delete when unused
+		false,                                    // not exclusive
+		false,                                    // no-wait
+		amqp.Table{"x-dead-letter-exchange": "clearsky.dlx.v1", "x-dead-letter-routing-key": "clearsky.instructor-review.commands.v1.dead"},
 	)
 	errorHandling(err, "Failed to declare queue")
+
+	_, err = Mqch.QueueDeclare("clearsky.instructor-review.commands.v1.dlq", true, false, false, false, nil)
+	errorHandling(err, "Failed to declare DLQ")
+	err = Mqch.QueueBind("clearsky.instructor-review.commands.v1.dlq", "clearsky.instructor-review.commands.v1.dead", "clearsky.dlx.v1", false, nil)
+	errorHandling(err, "Failed to bind DLQ")
 
 	// bind the queue to each routing key
 	for _, key := range routingKeysinstructor {
@@ -79,15 +122,15 @@ func StartConsumer() {
 
 	go func() {
 		for d := range msgs {
-			fmt.Printf("Received message: %s", d.Body)
-
 			response, err := routes.Routing(d.RoutingKey, d.Body)
 			if err != nil {
 				fmt.Printf("Error processing message for routing key %s: %v", d.RoutingKey, err)
-				response = fmt.Sprintf(`{"error": "%s"}`, err.Error())
 			}
-
-			fmt.Printf("Reply: %s\n", response)
+			body := encodeRPCResponse(response, err)
+			if d.ReplyTo == "" {
+				_ = d.Nack(false, false)
+				continue
+			}
 
 			err = Mqch.Publish(
 				"",        // default exchange for reply
@@ -97,7 +140,7 @@ func StartConsumer() {
 				amqp.Publishing{
 					ContentType:   "application/json",
 					CorrelationId: d.CorrelationId,
-					Body:          []byte(response),
+					Body:          body,
 				},
 			)
 

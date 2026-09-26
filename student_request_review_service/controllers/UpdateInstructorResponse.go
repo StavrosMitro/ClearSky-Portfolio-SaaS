@@ -97,11 +97,7 @@ func UpdateInstructorResponse(body map[string]interface{}) (string, error) {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		failResponse := map[string]interface{}{
-			"message": "Failed to update instructor response in database on student end.",
-		}
-		failRespBytes, _ := json.Marshal(failResponse)
-		return string(failRespBytes), nil
+		return "", fmt.Errorf("review not found")
 	}
 
 	response := map[string]interface{}{

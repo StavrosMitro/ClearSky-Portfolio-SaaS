@@ -11,6 +11,12 @@ const mongoose       = require('mongoose');
 const { MongoClient } = require('mongodb');
 const XLSX           = require('xlsx');
 
+const rpcOK = data => ({ version: 1, data });
+const rpcError = (code, message, retryable = false) => ({
+  version: 1,
+  error: { code, message, retryable }
+});
+
 /* const {
   MONGO_URI,
   RABBITMQ_URI,
@@ -85,6 +91,7 @@ if (missingVars.length > 0) {
     conn = await amqp.connect(RABBITMQ_URI);
     channel = await conn.createChannel();
     await channel.assertExchange(RABBITMQ_EXCHANGE, 'direct', { durable: true });
+    await channel.assertExchange('clearsky.dlx.v1', 'direct', { durable: true });
     console.log('✅  Connected to RabbitMQ and exchange set');
   } catch (err) {
     console.error('❌ RabbitMQ connection/setup failed:', err.message);
@@ -108,15 +115,34 @@ if (missingVars.length > 0) {
 
   // ─── Listener 1: Grades
   {
-    const q1 = await channel.assertQueue('', { exclusive: true });
+    const q1 = await channel.assertQueue('clearsky.final-grades.commands.v1', { durable: true, arguments: { 'x-dead-letter-exchange': 'clearsky.dlx.v1', 'x-dead-letter-routing-key': 'clearsky.final-grades.commands.v1.dead' } });
+    await channel.assertQueue('clearsky.final-grades.commands.v1.dlq', { durable: true });
+    await channel.bindQueue('clearsky.final-grades.commands.v1.dlq', 'clearsky.dlx.v1', 'clearsky.final-grades.commands.v1.dead');
     await channel.bindQueue(q1.queue, RABBITMQ_EXCHANGE, RABBITMQ_ROUTING_KEY);
+    await channel.bindQueue(q1.queue, RABBITMQ_EXCHANGE, RABBITMQ_CREDIT_INCR_KEY);
     channel.prefetch(10);
     console.log(`🚀  Listening for grades on "${RABBITMQ_ROUTING_KEY}"`);
 
     channel.consume(q1.queue, async msg => {
       if (!msg) return;
-      console.log('📩  Received grade message');
       const reply = makeReply(msg);
+      if (msg.fields.routingKey === RABBITMQ_CREDIT_INCR_KEY) {
+        try {
+          const { name, amount } = JSON.parse(msg.content.toString());
+          if (typeof name !== 'string' || !name.trim() || !Number.isFinite(amount) || amount <= 0) throw new Error('INVALID_CREDIT_PAYLOAD');
+          const existing = await creditsColl.findOne({ name });
+          if (!existing) await creditsColl.insertOne({ name, cred: 50 + amount });
+          else await creditsColl.updateOne({ name }, { $inc: { cred: amount } });
+          reply(rpcOK({ message: 'Credits updated' }));
+          channel.ack(msg);
+        } catch (err) {
+          const invalid = err.message === 'INVALID_CREDIT_PAYLOAD';
+          reply(rpcError(invalid ? 'INVALID_REQUEST' : 'INTERNAL_ERROR', invalid ? 'A valid institution and positive amount are required' : 'Could not update credits', !invalid));
+          channel.nack(msg, false, false);
+        }
+        return;
+      }
+      console.log('📩  Received grade message');
 
       const ct = (msg.properties.contentType || '').toLowerCase().trim();
       const buffer = (ct.includes('spreadsheet') || ct === 'application/octet-stream')
@@ -180,58 +206,20 @@ if (missingVars.length > 0) {
         //     { name: "NTUA" }, { $inc: { cred: -1 } })
         const res = await Grade.insertMany(docs, { ordered: false });
         console.log(`✅  Inserted ${res.length} grades`);
-        reply({ status: 'ok', message: `Inserted ${res.length}` });
+        reply(rpcOK({ message: `Inserted ${res.length}` }));
         channel.ack(msg);
 
       } catch (err) {
         console.error('❌ Error processing grades:', err.message);
-        reply({ status: 'error', message: err.message });
+        const invalid = err.message === 'Template too short';
+        reply(rpcError(invalid ? 'INVALID_REQUEST' : 'INTERNAL_ERROR', invalid ? 'Invalid grade workbook' : 'Could not import grades', !invalid));
         channel.nack(msg, false, false);
       }
     }, { noAck: false });
   }
 
-  // ─── Listener 2: Credit Top-ups
-{
-  const q2 = await channel.assertQueue('', { exclusive: true });
-  await channel.bindQueue(q2.queue, RABBITMQ_EXCHANGE, RABBITMQ_CREDIT_INCR_KEY);
-  console.log(`🚀  Listening for credit top-ups on "${RABBITMQ_CREDIT_INCR_KEY}"`);
+  // `incr.credits` is handled by the same owned command queue as final uploads.
+  // Keeping dispatch in one consumer prevents RabbitMQ from load-balancing unrelated
+  // work between separate consumers of a shared queue.
 
-  channel.consume(q2.queue, async msg => {
-  if (!msg) return;
-  console.log('📩  Received credit top-up message');
-  const reply = makeReply(msg);
-
-  try {
-    const content = msg.content.toString();
-    const { name, amount } = JSON.parse(content);
-    console.log(`🔄  Top-up request for ${name}: +${amount}`);
-
-    if (typeof name !== 'string' || typeof amount !== 'number') {
-      throw new Error('Invalid payload: expected {name: string, amount: number}');
-    }
-
-    const existing = await creditsColl.findOne({ name });
-
-    if (!existing) {
-      // Insert new record with default credit + top-up amount
-      await creditsColl.insertOne({ name, cred: 50 + amount });
-      console.log(`🆕  Created new record for ${name} with default 50 and added ${amount}`);
-      reply({ status: 'ok', message: `Created new record with 50 + ${amount} for ${name}` });
-    } else {
-      // Increment credit for existing record
-      await creditsColl.updateOne({ name }, { $inc: { cred: amount } });
-      console.log(`✅  Increased credit for ${name} by ${amount}`);
-      reply({ status: 'ok', message: `+${amount} to ${name}` });
-    }
-
-    channel.ack(msg);
-
-  } catch (err) {
-    console.error('❌ Error processing credit top-up:', err.message);
-    reply({ status: 'error', message: err.message });
-    channel.nack(msg, false, false);
-  }
-}, { noAck: false });
-}
 })();

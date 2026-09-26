@@ -1,39 +1,47 @@
 import { flash } from '../../script.js';
-import { registerUser, changePassword } from '../../api/users.js';
+import { changePassword } from '../../api/users.js';
+import { registerInstructor, uploadStudentRoster } from '../../api/institution.js';
 
-const form            = document.querySelector('#user-mgmt-form');
-const roleSelect      = document.querySelector('#role');
-const studentIdGroup  = document.querySelector('#student-id-group');
-
-// Show/hide Student ID field
-roleSelect.addEventListener('change', () => {
-  studentIdGroup.style.display =
-    roleSelect.value === 'student' ? 'block' : 'none';
-});
-
-// Add user handler
-form.addEventListener('submit', async e => {
+// Register instructor handler
+const instructorForm = document.querySelector('#instructor-form');
+instructorForm.addEventListener('submit', async e => {
   e.preventDefault();
-
-  const username   = form.username.value.trim();
-  const password   = form.password.value;
-  const role       = form.role.value;
-  const student_id = role === 'student'
-    ? form.student_id.value.trim()
-    : undefined;
-
-  if (!username || !password) {
-    return flash('Username and password are required');
+  const email = instructorForm.email.value.trim();
+  if (!email) {
+    return flash('The instructor e-mail is required');
   }
-
   try {
-    await registerUser({ username, password, role, student_id });
-    flash('User added!');
-    form.reset();
-    studentIdGroup.style.display = 'none';
+    const { resent } = await registerInstructor({ email });
+    flash(resent ? 'Invitation sent again ✔' : 'Instructor registered; invitation sent ✔');
+    instructorForm.reset();
   } catch (err) {
     flash(`Error: ${err.message}`);
   }
+});
+
+// Student registry upload handler
+const rosterForm   = document.querySelector('#roster-form');
+const rosterResult = document.querySelector('#roster-result');
+rosterForm.addEventListener('submit', async e => {
+  e.preventDefault();
+  const file = rosterForm.file.files[0];
+  rosterResult.style.display = 'none';
+  if (!file) {
+    return flash('Choose a CSV file first');
+  }
+  try {
+    const result = await uploadStudentRoster(file);
+    rosterResult.style.color = '#006400';
+    rosterResult.textContent =
+      `Imported ${result.received} rows: ${result.inserted} new, ` +
+      `${result.updated} updated, ${result.unchanged} unchanged.`;
+    rosterForm.reset();
+  } catch (err) {
+    // The message lists the offending line numbers.
+    rosterResult.style.color = '#c00';
+    rosterResult.textContent = err.message;
+  }
+  rosterResult.style.display = 'block';
 });
 
 // Change password handler

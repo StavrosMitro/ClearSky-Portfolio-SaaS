@@ -15,17 +15,11 @@ type SpendReq struct {
 	// code int `json:"code"`
 }
 
-type Response struct {
-	Status  string `json:"status"`  // "ok", "conflict", "error"
-	Message string `json:"message"` // details for humans
-	Err     error  `json:"err"`
-}
-
 func Spending(d amqp.Delivery, ch *amqp.Channel) {
 	log.Printf("[Spending] Received message. CorrelationID=%s, ReplyTo=%s", d.CorrelationId, d.ReplyTo)
 
 	var req SpendReq
-	var res Response
+	var res RPCEnvelope
 
 	// Ensure the message is acknowledged at the end, no matter what.
 	defer func() {
@@ -37,9 +31,7 @@ func Spending(d amqp.Delivery, ch *amqp.Channel) {
 	// 1. Parse JSON ---------------------------------------------------------
 	if err := json.Unmarshal(d.Body, &req); err != nil {
 		log.Printf("[Spending] JSON unmarshal error: %v | Body=%s", err, string(d.Body))
-		res.Status = "error"
-		res.Message = "Invalid JSON"
-		res.Err = nil
+		res = rpcFailure("INVALID_REQUEST", "A valid spending request is required", false)
 		publishReply(ch, d, res)
 		return
 	}
@@ -50,29 +42,23 @@ func Spending(d amqp.Delivery, ch *amqp.Channel) {
 	log.Printf("[Spending] dbService.Diminish(Name=%s, Amount=%d) => isComplete=%t, err=%v", req.Name, req.Amount, isComplete, err)
 
 	if err != nil {
-		res.Status = "error"
-		res.Message = "Error in internal process or not enough credits"
-		res.Err = err
+		res = rpcFailure("INSUFFICIENT_CREDITS", "Not enough credits", false)
 		publishReply(ch, d, res)
 		return
 	}
 
 	if isComplete {
-		res.Status = "OK"
-		res.Message = "Valid spent of your credits"
-		res.Err = nil
+		res = rpcSuccess(map[string]string{"message": "Credits spent"})
 		publishReply(ch, d, res)
 		return
 	}
 
 	// If we reach here, it means credits were diminished but not fully consumed (business rule dependent)
-	res.Status = "conflict"
-	res.Message = "Partial credits spent; remaining balance exists"
-	res.Err = nil
+	res = rpcFailure("CONFLICT", "Credits could not be fully spent", false)
 	publishReply(ch, d, res)
 }
 
-func publishReply(ch *amqp.Channel, d amqp.Delivery, res Response) {
+func publishReply(ch *amqp.Channel, d amqp.Delivery, res RPCEnvelope) {
 	// fire-and-forget call; nothing to send back
 	if d.ReplyTo == "" {
 		log.Printf("[publishReply] ReplyTo empty; not sending any response. CorrelationID=%s", d.CorrelationId)

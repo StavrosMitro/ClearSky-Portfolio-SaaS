@@ -13,56 +13,39 @@ type AvailableReq struct {
 	Name string `json:"name"`
 }
 
-type AvailableResp struct {
-	Status      string `json:"status"`            // "ok" or "error"
-	Credits     int    `json:"credits,omitempty"` // only on success
-	Message     string `json:"message"`           // human-readable
-	ErrorDetail string `json:"error,omitempty"`   // optional error text
-}
-
 func AvailableHandler(d amqp.Delivery, ch *amqp.Channel) {
 	var req AvailableReq
 	log.Printf("We are inside the microservices for return available credits")
 	if err := json.Unmarshal(d.Body, &req); err != nil {
 		log.Printf("Invalid JSON in AvailableHandler: %v", err)
-		sendAvailableReplyAndNack(ch, d, AvailableResp{
-			Status:      "error",
-			Message:     "Invalid JSON",
-			ErrorDetail: err.Error(),
-		}, false)
+		sendAvailableReplyAndNack(ch, d, rpcFailure("INVALID_REQUEST", "A valid credits request is required", false), false)
+		return
+	}
+	if req.Name == "" {
+		sendAvailableReplyAndNack(ch, d, rpcFailure("INVALID_REQUEST", "Institution name is required", false), false)
 		return
 	}
 
 	credits, err := dbService.AvailableCredits(req.Name)
 	if err != nil {
 		log.Printf("DB error in AvailableHandler: %v", err)
-		sendAvailableReplyAndNack(ch, d, AvailableResp{
-			Status:      "error",
-			Message:     "Could not fetch balance",
-			ErrorDetail: err.Error(),
-		}, true)
+		sendAvailableReplyAndNack(ch, d, rpcFailure("DEPENDENCY_UNAVAILABLE", "Credits store is unavailable", true), true)
 		return
 	}
 
-	res := AvailableResp{
-		Status:  "ok",
-		Credits: credits,
-		Message: "Current balance",
-	}
+	res := rpcSuccess(map[string]int{"credits": credits})
 
 	if err := publishAvailableReply(ch, d, res); err != nil {
 		log.Printf("Publish reply failed in AvailableHandler: %v", err)
 		d.Nack(false, true)
 		return
 	}
-	log.Printf(res.Status)
-	log.Print(res)
-	log.Printf("Available credits %d", res.Credits)
+	log.Printf("Available credits %d", credits)
 	d.Ack(false)
 }
 
 // sendAvailableReplyAndNack publishes the response and nacks the message
-func sendAvailableReplyAndNack(ch *amqp.Channel, d amqp.Delivery, res AvailableResp, requeue bool) {
+func sendAvailableReplyAndNack(ch *amqp.Channel, d amqp.Delivery, res RPCEnvelope, requeue bool) {
 	if err := publishAvailableReply(ch, d, res); err != nil {
 		log.Printf("Failed to publish AvailableResp: %v", err)
 	}
@@ -70,7 +53,7 @@ func sendAvailableReplyAndNack(ch *amqp.Channel, d amqp.Delivery, res AvailableR
 }
 
 // publishAvailableReply serializes a response and publishes it to d.ReplyTo.
-func publishAvailableReply(ch *amqp.Channel, d amqp.Delivery, res AvailableResp) error {
+func publishAvailableReply(ch *amqp.Channel, d amqp.Delivery, res RPCEnvelope) error {
 	if d.ReplyTo == "" {
 		return nil
 	}

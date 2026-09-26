@@ -84,12 +84,8 @@ func PostReply(body map[string]interface{}) (string, error) {
 	log.Printf("PostReply: rows affected: %d", rowsAffected)
 	if rowsAffected == 0 {
 		log.Println("PostReply: no rows updated, possible invalid identifiers")
-		failResponse := map[string]interface{}{
-			"message": "Failed to update instructor response in database on student end.",
-		}
-		failRespBytes, _ := json.Marshal(failResponse) // nolint: errcheck
 		log.Println("PostReply: returning failure response to orchestrator")
-		return string(failRespBytes), nil
+		return "", fmt.Errorf("review not found")
 	}
 
 	successResponse := map[string]interface{}{

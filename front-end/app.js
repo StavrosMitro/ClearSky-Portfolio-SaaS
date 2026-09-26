@@ -9,6 +9,11 @@ import morgan            from 'morgan';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app       = express();
 
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
+  throw new Error('SESSION_SECRET must contain at least 32 characters');
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 0)  API base-URL resolution
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,9 +47,14 @@ app.use(express.json());
 // 4)  Sessions & locals
 // ─────────────────────────────────────────────────────────────────────────────
 app.use(session({
-  secret           : 'change-this-secret',
+  secret           : SESSION_SECRET,
   resave           : false,
-  saveUninitialized: true,
+  saveUninitialized: false,
+  cookie           : {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.COOKIE_SECURE === 'true'
+  }
 }));
 app.use((req, res, next) => {
   res.locals.user       = req.session.user || null;
@@ -64,33 +74,32 @@ app.set('views', path.join(__dirname, 'views'));
 //    Forward front-end `/auth/google/...` to your google_auth_service.
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/auth/google/login', (req, res) => {
-  const role = req.query.role || 'institution_representative';
   // For Docker, we need to redirect to the external URL
   const externalGoogleAuthUrl = process.env.GOOGLE_AUTH_EXTERNAL_URL || 'http://localhost:8086';
-  res.redirect(`${externalGoogleAuthUrl}/auth/google/login?role=${role}`);
+  res.redirect(`${externalGoogleAuthUrl}/auth/google/login`);
 });
 
+async function authenticatedUser(req) {
+  const token = req.cookies.jwt;
+  if (!token) return null;
+  const response = await fetch(`${API_BASE}/user/me`, {
+    headers: { Cookie: `jwt=${encodeURIComponent(token)}` }
+  });
+  if (!response.ok) return null;
+  const payload = await response.json();
+  return payload.data || null;
+}
+
 // Handle successful Google login callback
-app.get('/auth/google/callback', (req, res) => {
-  console.log('Google callback received:', req.query);
-  
-  // Check if we have a JWT cookie
-  const token = req.cookies.token;
-  const role = req.query.role || 'institution_representative';
-  const email = req.query.email;
-  
-  if (token && req.query.google_login === 'success') {
-    // Set session for Google user
-    req.session.user = {
-      username: email || 'google_user',
-      role: role
-    };
-    
-    console.log('Set session user:', req.session.user);
-    
+app.get('/auth/google/callback', async (req, res) => {
+  try {
+    const user = req.query.google_login === 'success' ? await authenticatedUser(req) : null;
+    if (!user) return res.redirect('/login?error=google_login_failed');
+    req.session.user = { username: user.username, role: user.role };
+
     // Redirect based on role
     let redirectPath = '/';
-    switch (role) {
+    switch (user.role) {
       case 'student':
         redirectPath = '/student';
         break;
@@ -104,10 +113,9 @@ app.get('/auth/google/callback', (req, res) => {
         redirectPath = '/';
     }
     
-    res.redirect(redirectPath);
-  } else {
-    console.log('Google login failed - no token or success flag');
-    res.redirect('/login?error=google_login_failed');
+    return res.redirect(redirectPath);
+  } catch (_) {
+    return res.redirect('/login?error=google_login_failed');
   }
 });
 
@@ -151,9 +159,33 @@ app.get('/signup', (_, res) =>
   res.render('signup', { title: 'Sign Up', user: null })
 );
 
-app.get('/login', (_, res) =>
-  res.render('login', { title: 'Log in', error: null, user: null })
+// Fixed messages for known reasons; the query string is never echoed.
+const LOGIN_ERRORS = {
+  google_domain          : 'Sign in with your university Google account.',
+  google_not_registered  : 'This Google account is not registered. Students must be in the secretariat\'s registry; instructors are registered by the secretariat.',
+  google_account_conflict: 'An account already exists for this student ID. Sign in with your password.',
+  google_login_failed    : 'Google sign-in failed. Please try again.'
+};
+
+app.get('/login', (req, res) =>
+  res.render('login', {
+    title : 'Log in',
+    error : LOGIN_ERRORS[req.query.error] || null,
+    notice: req.query.activated === '1' ? 'Your password is set. You can now log in.' : null,
+    user  : null
+  })
 );
+
+// Emailed links: the token stays in the URL fragment and is read client-side.
+app.get('/activate', (_, res) =>
+  res.render('activate', { title: 'Choose your password', user: null })
+);
+
+// First Google sign-in of a registry student: confirm the student ID.
+app.get('/signup/google', (req, res) => {
+  if (!req.cookies.google_signup) return res.redirect('/login?error=google_login_failed');
+  res.render('googleSignup', { title: 'Confirm your student ID', user: null });
+});
 
 // CLASSIC form POST – creates session
 app.post('/login', async (req, res) => {
@@ -164,15 +196,19 @@ app.post('/login', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body   : JSON.stringify({ username, password })
     });
-    const data = await response.json();
+    const payload = await response.json();
+    const data = payload.data || {};
 
     if (!response.ok || !data.role) {
       return res.render('login', {
         title : 'Log in',
-        error : data.message || 'Invalid credentials',
+        error : payload.error?.message || 'Invalid credentials',
+        notice: null,
         user  : null
       });
     }
+	const sessionCookie = response.headers.get('set-cookie');
+	if (sessionCookie) res.setHeader('Set-Cookie', sessionCookie);
 
     req.session.user = { username, role: data.role };
 
@@ -185,22 +221,28 @@ app.post('/login', async (req, res) => {
     return res.render('login', {
       title : 'Log in',
       error : 'Login failed',
+      notice: null,
       user  : null
     });
   }
 });
 
-app.post('/api/session', (req, res) => {
-  const { username, role } = req.body;
-  if (!username || !role) {
-    return res.status(400).json({ error: 'username and role required' });
+app.post('/api/session', async (req, res) => {
+  try {
+    const user = await authenticatedUser(req);
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    req.session.user = { username: user.username, role: user.role };
+    return res.sendStatus(200);
+  } catch (_) {
+    return res.status(503).json({ error: 'Authentication service unavailable' });
   }
-  req.session.user = { username, role };
-  res.sendStatus(200);
 });
 
 app.get('/logout', (req, res) =>
-  req.session.destroy(() => res.redirect('/login'))
+  req.session.destroy(() => {
+    res.clearCookie('jwt', { path: '/' });
+    res.redirect('/login');
+  })
 );
 
 // Student UI
@@ -248,4 +290,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log(`✔ Front-end listening at http://localhost:${PORT}`)
 );
-

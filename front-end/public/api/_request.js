@@ -5,33 +5,16 @@
 const API_BASE = 'http://localhost:8080';
 
 /**
- * Read the JWT from localStorage (or cookie fallback).
- */
-function getJWT() {
-  const fromLS = window.localStorage?.getItem('jwt');
-  if (fromLS) return fromLS;
-  const m = document.cookie.match(/(?:^|;\s*)jwt=([^;]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
-}
-
-/**
  * Generic request helper that:
  *  • automatically JSON‐stringifies objects (except GETs, which become query strings)
  *  • sends FormData unchanged
- *  • injects `Authorization: Bearer <token>` if you have a JWT
+ *  • sends the HttpOnly session cookie
+ *  • unwraps the public `{ data, request_id }` response envelope
  */
 export async function request(path, { method = 'GET', body, headers } = {}) {
-  console.log('→ [API]', method, path, 'body:', body);
-
   // build full URL
   let url = API_BASE + path;
-  const opts = { method, headers: { ...headers } };
-
-  // inject auth
-  const token = getJWT();
-  if (token && !opts.headers.Authorization) {
-    opts.headers.Authorization = `Bearer ${token}`;
-  }
+  const opts = { method, credentials: 'include', headers: { ...headers } };
 
   // If GET + plain object, turn into query string
   if (method.toUpperCase() === 'GET' && body && !(body instanceof FormData)) {
@@ -52,7 +35,10 @@ export async function request(path, { method = 'GET', body, headers } = {}) {
   const json = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    throw new Error(json.message || json.error || res.statusText);
+    const error = new Error(json.error?.message || res.statusText || 'Request failed');
+    error.code = json.error?.code;
+    error.requestId = json.request_id;
+    throw error;
   }
-  return json;
+  return json.data;
 }

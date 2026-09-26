@@ -17,9 +17,16 @@ type UserRequest struct {
 }
 
 // Response is sent back to the orchestrator
+type RPCError struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Retryable bool   `json:"retryable"`
+}
+
 type Response struct {
-	Status  string `json:"status"`  // "ok", "conflict", "error"
-	Message string `json:"message"` // details for humans
+	Version int       `json:"version"`
+	Data    any       `json:"data,omitempty"`
+	Error   *RPCError `json:"error,omitempty"`
 }
 
 func HandleRegister(d amqp.Delivery, ch *amqp.Channel) {
@@ -37,8 +44,12 @@ func HandleRegister(d amqp.Delivery, ch *amqp.Channel) {
 	log.Println("… Parsing JSON payload")
 	if err := json.Unmarshal(d.Body, &req); err != nil {
 		log.Printf("❌ JSON unmarshal error: %v", err)
-		res.Status = "error"
-		res.Message = "Invalid JSON"
+		res = Response{Version: 1, Error: &RPCError{Code: "INVALID_REQUEST", Message: "A valid institution request is required"}}
+		publishReply(ch, d, res)
+		return
+	}
+	if req.Name == "" || req.Email == "" || req.Director == "" {
+		res = Response{Version: 1, Error: &RPCError{Code: "INVALID_REQUEST", Message: "Name, email and director are required"}}
 		publishReply(ch, d, res)
 		return
 	}
@@ -50,12 +61,10 @@ func HandleRegister(d amqp.Delivery, ch *amqp.Channel) {
 	if err != nil {
 		if code == 2 {
 			log.Printf("⚠ Conflict: institution %q already registered", req.Name)
-			res.Status = "conflict"
-			res.Message = "Institution already registered"
+			res = Response{Version: 1, Error: &RPCError{Code: "CONFLICT", Message: "Institution already registered"}}
 		} else {
 			log.Printf("❌ Database error for %q: %v", req.Name, err)
-			res.Status = "error"
-			res.Message = "Database error"
+			res = Response{Version: 1, Error: &RPCError{Code: "DEPENDENCY_UNAVAILABLE", Message: "Institution store is unavailable", Retryable: true}}
 		}
 		publishReply(ch, d, res)
 		return
@@ -63,8 +72,7 @@ func HandleRegister(d amqp.Delivery, ch *amqp.Channel) {
 
 	// 3. Success ------------------------------------------------------------
 	log.Printf("✅ Institution %q registered (code %d)", req.Name, code)
-	res.Status = "ok"
-	res.Message = "Institution registered successfully"
+	res = Response{Version: 1, Data: map[string]string{"message": "Institution registered successfully"}}
 	publishReply(ch, d, res)
 }
 

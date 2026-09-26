@@ -2,6 +2,7 @@ package mq
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/streadway/amqp"
 )
@@ -11,9 +12,13 @@ var Mqch *amqp.Channel
 
 func InitRabbitMQ() error {
 	var err error
-	// FOR LOCAL TESTING ONLY.
-	//Mqconn, err = amqp.Dial("amqp://guest:guest@localhost:5672/")
-	Mqconn, err = amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
+	url := os.Getenv("AMQP_URL")
+	if url == "" {
+		// Standalone development only; the root stack always sets AMQP_URL.
+		url = "amqp://guest:guest@rabbitmq:5672/"
+		fmt.Println("AMQP_URL is not set; using the development default")
+	}
+	Mqconn, err = amqp.Dial(url)
 	if err != nil {
 		fmt.Println("Failed to connect to RabbitMQ:", err)
 		return err

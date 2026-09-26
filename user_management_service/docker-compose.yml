@@ -13,10 +13,17 @@ services:
   auth-service:
     build: .
     container_name: auth-service
-    ports:
-      - "8082:8082"
+    # Internal only: the orchestrator is the public API boundary.
+    expose:
+      - "8082"
     depends_on:
       - rabbitmq
     entrypoint: ["/bin/sh", "-c", "./wait-for-it.sh rabbitmq:5672 -- ./user_management_service"]
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set}
+      - JWT_ISSUER=${JWT_ISSUER:-clearsky-identity}
+      - JWT_AUDIENCE=${JWT_AUDIENCE:-clearsky-api}
+      - INTERNAL_AUTH_TOKEN=${INTERNAL_AUTH_TOKEN:?INTERNAL_AUTH_TOKEN must be set}
+      - BOOTSTRAP_ADMIN_USERNAME=${BOOTSTRAP_ADMIN_USERNAME:-}
+      - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-}

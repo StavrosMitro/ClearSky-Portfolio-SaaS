@@ -14,7 +14,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 
   try {
-    const { data } = await getReviewStatus({ course_id, exam_period });
+    const data = await getReviewStatus({ course_id, exam_period });
     // If backend returns a message (no review found), show it
     if (data && data.message) {
       flash(data.message);

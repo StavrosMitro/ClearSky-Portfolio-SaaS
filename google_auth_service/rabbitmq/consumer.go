@@ -3,46 +3,45 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
-	"google_auth_service/database"
-	"google_auth_service/utils"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
-	"strconv"
+	"time"
 
-	"github.com/google/uuid"
+	"google_auth_service/policy"
+
 	amqp "github.com/rabbitmq/amqp091-go"
-	"golang.org/x/oauth2/google"
 )
 
 type GoogleAuthRequest struct {
-	Type  string `json:"type"`
 	Token string `json:"token"`
-	Role  string `json:"role,omitempty"`
 }
 
-type GoogleAuthResponse struct {
-	Status    string `json:"status"`
-	Message   string `json:"message,omitempty"`
-	Token     string `json:"token,omitempty"`
-	Email     string `json:"email,omitempty"`
-	Role      string `json:"role,omitempty"`
-	StudentID string `json:"student_id,omitempty"`
+type verifiedIdentity struct {
+	Email string `json:"email"`
 }
 
-var allowedEmailsConsumer = map[string]bool{
-	"dimitris.thiv@gmail.com":   true,
-	"dimliakis2001@gmail.com":   true,
-	"rostav55@gmail.com":        true,
-	"anastasvasilis4@gmail.com": true,
+type rpcError struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Retryable bool   `json:"retryable"`
+}
+
+type rpcEnvelope struct {
+	Version int       `json:"version"`
+	Data    any       `json:"data,omitempty"`
+	Error   *rpcError `json:"error,omitempty"`
 }
 
 func StartGoogleAuthConsumer() {
-	url := os.Getenv("RABBITMQ_URL")
-	if url == "" {
-		url = "amqp://guest:guest@rabbitmq:5672/"
+	brokerURL := os.Getenv("RABBITMQ_URL")
+	if brokerURL == "" {
+		brokerURL = "amqp://guest:guest@rabbitmq:5672/"
 	}
-	conn, err := amqp.Dial(url)
+	conn, err := amqp.Dial(brokerURL)
 	if err != nil {
 		log.Fatal("RabbitMQ connection failed:", err)
 	}
@@ -51,24 +50,26 @@ func StartGoogleAuthConsumer() {
 		log.Fatal("RabbitMQ channel failed:", err)
 	}
 
-	// Declare exchange
-	err = ch.ExchangeDeclare("clearSky.events", "direct", true, false, false, false, nil)
-	if err != nil {
+	if err = ch.ExchangeDeclare("clearsky.commands.v1", "direct", true, false, false, false, nil); err != nil {
 		log.Fatal("Exchange declare failed:", err)
 	}
-
-	queue := "google_auth.request"
-	_, err = ch.QueueDeclare(queue, true, false, false, false, nil)
-	if err != nil {
+	if err = ch.ExchangeDeclare("clearsky.dlx.v1", "direct", true, false, false, false, nil); err != nil {
+		log.Fatal("DLX declare failed:", err)
+	}
+	queue := "clearsky.google-auth.commands.v1"
+	args := amqp.Table{"x-dead-letter-exchange": "clearsky.dlx.v1", "x-dead-letter-routing-key": queue + ".dead"}
+	if _, err = ch.QueueDeclare(queue, true, false, false, false, args); err != nil {
 		log.Fatal("Queue declare failed:", err)
 	}
-
-	// Bind to the correct routing key
-	err = ch.QueueBind(queue, "auth.login.google", "clearSky.events", false, nil)
-	if err != nil {
+	if _, err = ch.QueueDeclare(queue+".dlq", true, false, false, false, nil); err != nil {
+		log.Fatal("DLQ declare failed:", err)
+	}
+	if err = ch.QueueBind(queue+".dlq", queue+".dead", "clearsky.dlx.v1", false, nil); err != nil {
+		log.Fatal("DLQ bind failed:", err)
+	}
+	if err = ch.QueueBind(queue, "auth.login.google", "clearsky.commands.v1", false, nil); err != nil {
 		log.Fatal("Queue bind failed:", err)
 	}
-
 	msgs, err := ch.Consume(queue, "", false, false, false, false, nil)
 	if err != nil {
 		log.Fatal("Consume failed:", err)
@@ -76,109 +77,74 @@ func StartGoogleAuthConsumer() {
 
 	go func() {
 		for d := range msgs {
+			response := rpcEnvelope{}
 			var req GoogleAuthRequest
-			if err := json.Unmarshal(d.Body, &req); err != nil {
+			if err := json.Unmarshal(d.Body, &req); err != nil || req.Token == "" {
+				response = rpcEnvelope{Version: 1, Error: &rpcError{Code: "INVALID_REQUEST", Message: "A Google ID token is required"}}
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				email, hostedDomain, err := verifyGoogleToken(ctx, req.Token)
+				cancel()
+				accessPolicy, policyErr := policy.FromEnvironment()
+				switch {
+				case err != nil:
+					response = rpcEnvelope{Version: 1, Error: &rpcError{Code: "UNAUTHENTICATED", Message: "Invalid Google token"}}
+				case policyErr != nil:
+					log.Printf("Google access policy: %v", policyErr)
+					response = rpcEnvelope{Version: 1, Error: &rpcError{Code: "DEPENDENCY_UNAVAILABLE", Message: "Google login is unavailable", Retryable: true}}
+				case !accessPolicy.Allows(email, hostedDomain):
+					response = rpcEnvelope{Version: 1, Error: &rpcError{Code: "FORBIDDEN", Message: "Google account is not authorized"}}
+				default:
+					response = rpcEnvelope{Version: 1, Data: verifiedIdentity{Email: email}}
+				}
+			}
+
+			body, err := json.Marshal(response)
+			if err != nil || d.ReplyTo == "" {
+				_ = d.Nack(false, false)
 				continue
 			}
-
-			resp := GoogleAuthResponse{}
-			email, err := verifyGoogleToken(req.Token)
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = "Invalid Google token"
-			} else if !isEmailAllowed(email) {
-				resp.Status = "error"
-				resp.Message = "Access denied: Email not authorized"
-			} else {
-				// Find or create user with proper role handling
-				var user database.User
-				result := database.DB.First(&user, "email = ?", email)
-
-				role := req.Role
-				if role == "" {
-					role = "institution_representative" // Default for Google users
-				}
-
-				var studentID string
-				if result.Error != nil {
-					// Create new user - only assign student_id if role is student
-					if role == "student" {
-						studentID = generateStudentID()
-					}
-					user = database.User{
-						Email:     email,
-						Role:      role,
-						StudentID: studentID,
-						Provider:  "google",
-					}
-					database.DB.Create(&user)
-				} else {
-					// Only use student_id for students
-					if user.Role == "student" {
-						studentID = user.StudentID
-						if studentID == "" && role == "student" {
-							studentID = generateStudentID()
-							user.StudentID = studentID
-							database.DB.Save(&user)
-						}
-					}
-				}
-
-				userIDStr := strconv.Itoa(int(user.ID))
-				token, _ := utils.GenerateJWT(userIDStr, email, role, studentID)
-				resp.Status = "ok"
-				resp.Token = token
-				resp.Email = email
-				resp.Role = role
-				resp.StudentID = studentID
+			if err := ch.Publish("", d.ReplyTo, false, false, amqp.Publishing{ContentType: "application/json", CorrelationId: d.CorrelationId, Body: body}); err != nil {
+				log.Printf("publish Google auth reply: %v", err)
+				_ = d.Nack(false, true)
+				continue
 			}
-
-			body, _ := json.Marshal(resp)
-			if d.ReplyTo != "" && d.CorrelationId != "" {
-				ch.Publish(
-					"", d.ReplyTo, false, false,
-					amqp.Publishing{
-						ContentType:   "application/json",
-						CorrelationId: d.CorrelationId,
-						Body:          body,
-					},
-				)
-			}
-			d.Ack(false)
+			_ = d.Ack(false)
 		}
 	}()
 }
 
-// generateStudentID creates a unique student ID
-func generateStudentID() string {
-	return "STU" + uuid.New().String()[:8]
-}
-
-// Helper to verify Google token and extract email
-func verifyGoogleToken(idToken string) (string, error) {
-	ctx := context.Background()
-	oauth2Service, err := google.DefaultClient(ctx, "https://www.googleapis.com/auth/userinfo.email")
-	if err != nil {
-		return "", err
+func verifyGoogleToken(ctx context.Context, idToken string) (string, string, error) {
+	clientID := os.Getenv("GOOGLE_CLIENT_ID")
+	if clientID == "" {
+		return "", "", errors.New("GOOGLE_CLIENT_ID is not configured")
 	}
-	resp, err := oauth2Service.Get("https://www.googleapis.com/oauth2/v3/tokeninfo?id_token=" + idToken)
+	endpoint := "https://oauth2.googleapis.com/tokeninfo?id_token=" + url.QueryEscape(idToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", err
 	}
 	defer resp.Body.Close()
-	var tokenInfo struct {
-		Email string `json:"email"`
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("tokeninfo status %d", resp.StatusCode)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tokenInfo); err != nil {
-		return "", err
+	var info struct {
+		Audience      string `json:"aud"`
+		Issuer        string `json:"iss"`
+		Email         string `json:"email"`
+		EmailVerified string `json:"email_verified"`
+		HostedDomain  string `json:"hd"`
 	}
-	if tokenInfo.Email == "" {
-		return "", http.ErrNoCookie
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return "", "", err
 	}
-	return tokenInfo.Email, nil
-}
-
-// Helper function to check if email is allowed
-func isEmailAllowed(email string) bool {
-	return allowedEmailsConsumer[email]
+	validIssuer := info.Issuer == "accounts.google.com" || info.Issuer == "https://accounts.google.com"
+	if info.Audience != clientID || !validIssuer || info.Email == "" || info.EmailVerified != "true" {
+		return "", "", errors.New("Google token claims are invalid")
+	}
+	return info.Email, info.HostedDomain, nil
 }

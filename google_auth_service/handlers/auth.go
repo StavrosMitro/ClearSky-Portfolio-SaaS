@@ -3,215 +3,230 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"google_auth_service/database"
-	"google_auth_service/rabbitmq"
-	"google_auth_service/utils"
+	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"strings"
 	"time"
+
+	"google_auth_service/policy"
+	"google_auth_service/rabbitmq"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
-var (
-	oauthConfig *oauth2.Config
-	// Define specific allowed emails only - replace with your actual emails
-	allowedEmails = map[string]bool{
-		"dimitris.thiv@gmail.com":   true,
-		"dimliakis2001@gmail.com":   true,
-		"rostav55@gmail.com":        true,
-		"anastasvasilis4@gmail.com": true,
-	}
-)
+// signupCookie carries user management's short-lived ticket to the
+// student-ID step of a first Google login. It is HttpOnly and single-use.
+const signupCookie = "google_signup"
 
-func init() {
-	oauthConfig = &oauth2.Config{
-		RedirectURL:  os.Getenv("GOOGLE_REDIRECT_URL"), // πχ: http://localhost:8086/auth/google/callback
-		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
-		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
-		Scopes:       []string{"https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"},
+type userManagementLogin struct {
+	Token        string `json:"token"`
+	Role         string `json:"role"`
+	UserID       string `json:"user_id"`
+	SignupTicket string `json:"signup_ticket"`
+}
+
+// exchangeStatusError carries user management's HTTP status so the callback
+// can tell the user why sign-in failed.
+type exchangeStatusError struct{ status int }
+
+func (e *exchangeStatusError) Error() string {
+	return fmt.Sprintf("user management status %d", e.status)
+}
+
+func frontendURL() string {
+	if url := os.Getenv("FRONTEND_URL"); url != "" {
+		return strings.TrimRight(url, "/")
+	}
+	return "http://localhost:3000"
+}
+
+// redirectToLogin shows a fixed, non-sensitive reason on the login page.
+func redirectToLogin(w http.ResponseWriter, r *http.Request, reason string) {
+	http.Redirect(w, r, frontendURL()+"/login?error="+reason, http.StatusTemporaryRedirect)
+}
+
+func oauthConfiguration() (*oauth2.Config, error) {
+	clientID := os.Getenv("GOOGLE_CLIENT_ID")
+	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+	redirectURL := os.Getenv("GOOGLE_REDIRECT_URL")
+	if clientID == "" || clientSecret == "" || redirectURL == "" {
+		return nil, errors.New("Google OAuth is not configured")
+	}
+	return &oauth2.Config{
+		RedirectURL:  redirectURL,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		Scopes:       []string{"openid", "email", "profile"},
 		Endpoint:     google.Endpoint,
+	}, nil
+}
+
+func secureCookie() bool { return strings.EqualFold(os.Getenv("COOKIE_SECURE"), "true") }
+
+func newOAuthState() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
 	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-// helper to validate role - default Google users to representative
-func normalizeRole(r string) string {
-	switch r {
-	case "student", "instructor", "institution_representative":
-		return r
-	default:
-		return "institution_representative" // Changed from "student" to "institution_representative"
-	}
-}
-
-// generateStudentID creates a unique student ID for new student users
-func generateStudentID() string {
-	// Generate a simple numeric student ID based on timestamp and random component
-	timestamp := time.Now().Unix()
-	return fmt.Sprintf("STU%d", timestamp%1000000)
-}
-
-// Redirects user to Google's consent screen
 func GoogleLoginHandler(w http.ResponseWriter, r *http.Request) {
-	// allow client to pass desired role on first login
-	role := normalizeRole(r.URL.Query().Get("role"))
-	url := oauthConfig.AuthCodeURL(role, oauth2.AccessTypeOffline) // state carries role
-	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+	config, err := oauthConfiguration()
+	if err != nil {
+		http.Error(w, "Google login is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := newOAuthState()
+	if err != nil {
+		http.Error(w, "Google login is unavailable", http.StatusInternalServerError)
+		return
+	}
+	var options []oauth2.AuthCodeOption
+	if accessPolicy, err := policy.FromEnvironment(); err == nil && accessPolicy.HostedDomainHint() != "" {
+		options = append(options, oauth2.SetAuthURLParam("hd", accessPolicy.HostedDomainHint()))
+	}
+	http.SetCookie(w, &http.Cookie{Name: "oauth_state", Value: state, Path: "/auth/google/callback", HttpOnly: true, Secure: secureCookie(), SameSite: http.SameSiteLaxMode, MaxAge: 600})
+	http.Redirect(w, r, config.AuthCodeURL(state, options...), http.StatusTemporaryRedirect)
 }
 
-// Helper function to check if email is allowed - simplified to use only hardcoded emails
-func isEmailAllowed(email string) bool {
-	return allowedEmails[email]
-}
-
-// Handles Google's callback and fetches user info
 func GoogleCallbackHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	config, err := oauthConfiguration()
+	if err != nil {
+		http.Error(w, "Google login is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	stateCookie, err := r.Cookie("oauth_state")
+	providedState := r.URL.Query().Get("state")
+	if err != nil || providedState == "" || len(providedState) != len(stateCookie.Value) || subtle.ConstantTimeCompare([]byte(providedState), []byte(stateCookie.Value)) != 1 {
+		http.Error(w, "Invalid OAuth state", http.StatusBadRequest)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "oauth_state", Value: "", Path: "/auth/google/callback", HttpOnly: true, Secure: secureCookie(), SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	code := r.URL.Query().Get("code")
-
 	if code == "" {
-		http.Error(w, "No code in request", http.StatusBadRequest)
+		http.Error(w, "Google did not provide an authorization code", http.StatusBadRequest)
 		return
 	}
 
-	token, err := oauthConfig.Exchange(ctx, code)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	token, err := config.Exchange(ctx, code)
 	if err != nil {
-		http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("Google OAuth exchange failed: %v", err)
+		http.Error(w, "Google login failed", http.StatusBadGateway)
+		return
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.googleapis.com/oauth2/v2/userinfo", nil)
+	if err != nil {
+		http.Error(w, "Google login failed", http.StatusInternalServerError)
+		return
+	}
+	response, err := config.Client(ctx, token).Do(request)
+	if err != nil {
+		log.Printf("Google userinfo request failed: %v", err)
+		http.Error(w, "Google login failed", http.StatusBadGateway)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		log.Printf("Google userinfo returned status %d", response.StatusCode)
+		http.Error(w, "Google login failed", http.StatusBadGateway)
+		return
+	}
+	var userInfo struct {
+		Email         string `json:"email"`
+		VerifiedEmail bool   `json:"verified_email"`
+		HostedDomain  string `json:"hd"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&userInfo); err != nil || userInfo.Email == "" || !userInfo.VerifiedEmail {
+		redirectToLogin(w, r, "google_login_failed")
+		return
+	}
+	accessPolicy, err := policy.FromEnvironment()
+	if err != nil {
+		log.Printf("Google access policy: %v", err)
+		http.Error(w, "Google login is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !accessPolicy.Allows(userInfo.Email, userInfo.HostedDomain) {
+		redirectToLogin(w, r, "google_domain")
 		return
 	}
 
-	client := oauthConfig.Client(ctx, token)
-	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")
+	applicationLogin, err := exchangeVerifiedEmail(ctx, userInfo.Email)
 	if err != nil {
-		http.Error(w, "Failed to get user info: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("user-management Google token exchange failed: %v", err)
+		var statusErr *exchangeStatusError
+		switch {
+		case errors.As(err, &statusErr) && statusErr.status == http.StatusForbidden:
+			redirectToLogin(w, r, "google_not_registered")
+		case errors.As(err, &statusErr) && statusErr.status == http.StatusConflict:
+			redirectToLogin(w, r, "google_account_conflict")
+		default:
+			redirectToLogin(w, r, "google_login_failed")
+		}
 		return
+	}
+	if applicationLogin.SignupTicket != "" {
+		http.SetCookie(w, &http.Cookie{Name: signupCookie, Value: applicationLogin.SignupTicket, Path: "/", HttpOnly: true, Secure: secureCookie(), SameSite: http.SameSiteLaxMode, MaxAge: 900})
+		http.Redirect(w, r, frontendURL()+"/signup/google", http.StatusTemporaryRedirect)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "jwt", Value: applicationLogin.Token, Path: "/", HttpOnly: true, Secure: secureCookie(), SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	rabbitmq.PublishLoginEvent(userInfo.Email)
+	http.Redirect(w, r, frontendURL()+"/auth/google/callback?google_login=success", http.StatusTemporaryRedirect)
+}
+
+func exchangeVerifiedEmail(ctx context.Context, email string) (userManagementLogin, error) {
+	host := os.Getenv("UMS_URL")
+	if host == "" {
+		host = "http://user_management_service:8082"
+	}
+	payload, err := json.Marshal(map[string]string{"email": email})
+	if err != nil {
+		return userManagementLogin{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+"/internal/google-login", bytes.NewReader(payload))
+	if err != nil {
+		return userManagementLogin{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("INTERNAL_AUTH_TOKEN"))
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return userManagementLogin{}, err
 	}
 	defer resp.Body.Close()
-
-	var userInfo map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
-		http.Error(w, "Failed to decode user info: "+err.Error(), http.StatusInternalServerError)
-		return
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return userManagementLogin{}, &exchangeStatusError{status: resp.StatusCode}
 	}
-
-	email := userInfo["email"].(string)
-
-	// Validate email is allowed
-	if !isEmailAllowed(email) {
-		http.Error(w, "Access denied: Your email is not authorized for this application", http.StatusForbidden)
-		return
+	var result userManagementLogin
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return userManagementLogin{}, err
 	}
-
-	// derive role from state - default to institution_representative for Google users
-	role := normalizeRole(r.URL.Query().Get("state"))
-	if r.URL.Query().Get("state") == "" {
-		role = "institution_representative"
-	}
-
-	name := userInfo["name"].(string)
-	picture := userInfo["picture"].(string)
-
-	// Find or create user in local database
-	var user database.User
-	result := database.DB.First(&user, "email = ?", email)
-
-	var studentID string
-	if result.Error != nil {
-		// Create new user - no student_id for representatives
-		user = database.User{
-			Email:     email,
-			Name:      name,
-			Picture:   picture,
-			Provider:  "google",
-			Role:      role,
-			StudentID: studentID, // Will be empty for representatives
+	// 202: a roster student without an account; the student-ID step follows.
+	if resp.StatusCode == http.StatusAccepted {
+		if result.SignupTicket == "" || result.Token != "" {
+			return userManagementLogin{}, errors.New("user management returned an invalid signup reply")
 		}
-		database.DB.Create(&user)
-	} else {
-		// Update existing user
-		user.Name = name
-		user.Picture = picture
-		if user.Role != role {
-			user.Role = role
-			// Only generate student_id if role is student
-			if role == "student" && user.StudentID == "" {
-				user.StudentID = generateStudentID()
-			}
-		}
-		database.DB.Save(&user)
-		// Only use student_id if user is a student
-		if user.Role == "student" {
-			studentID = user.StudentID
-		}
+		return result, nil
 	}
-
-	// Generate JWT with student_id only for students
-	userIDStr := strconv.Itoa(int(user.ID))
-	jwtToken, err := utils.GenerateJWT(userIDStr, email, user.Role, studentID)
-	if err != nil {
-		http.Error(w, "Failed to generate JWT: "+err.Error(), http.StatusInternalServerError)
-		return
+	if result.Token == "" || result.Role == "" || result.UserID == "" || result.SignupTicket != "" {
+		return userManagementLogin{}, errors.New("user management returned incomplete login data")
 	}
-
-	// Set cookie with proper domain settings for localhost
-	cookie := http.Cookie{
-		Name:     "token",
-		Value:    jwtToken,
-		Path:     "/",
-		Domain:   "",    // Empty domain for localhost
-		HttpOnly: false, // Set to false so frontend can read it
-		Secure:   false, // Set to true in production with HTTPS
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   86400, // 1 day
-	}
-
-	http.SetCookie(w, &cookie)
-
-	rabbitmq.PublishLoginEvent(email)
-
-	// Sync with User Management Service
-	umsHost := os.Getenv("UMS_URL")
-	if umsHost == "" {
-		umsHost = "http://user_management_service:8082"
-	}
-
-	upsertPayload := map[string]interface{}{
-		"username":   email, // Use email as username for Google users
-		"role":       user.Role,
-		"student_id": user.StudentID,
-	}
-
-	buf, _ := json.Marshal(upsertPayload)
-	http.Post(umsHost+"/upsert", "application/json", bytes.NewBuffer(buf))
-
-	// Redirect to frontend with Google login success parameter
-	frontendURL := os.Getenv("FRONTEND_URL")
-	if frontendURL == "" {
-		frontendURL = "http://localhost:3000"
-	}
-
-	// Always redirect to frontend callback to handle session setup
-	http.Redirect(w, r, frontendURL+"/auth/google/callback?google_login=success&role="+user.Role+"&email="+email, http.StatusTemporaryRedirect)
+	return result, nil
 }
 
-// LogoutHandler διαγράφει το token cookie
-func LogoutHandler(w http.ResponseWriter, r *http.Request) {
-	cookie := http.Cookie{
-		Name:     "token",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1, // Expire immediately
-		HttpOnly: true,
-		Secure:   false, // Set to true in production with HTTPS
-		SameSite: http.SameSiteLaxMode,
-	}
-
-	http.SetCookie(w, &cookie)
-
-	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte("<h1>Logout successful!</h1>"))
+func LogoutHandler(w http.ResponseWriter, _ *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: "jwt", Value: "", Path: "/", HttpOnly: true, Secure: secureCookie(), SameSite: http.SameSiteLaxMode, MaxAge: -1})
+	w.WriteHeader(http.StatusNoContent)
 }

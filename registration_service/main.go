@@ -59,7 +59,7 @@ func main() {
 	// ----------------------------------------------------------------------
 	// 3. Declare exchange & queue (idempotent; safe if already exist)
 	// ----------------------------------------------------------------------
-	exchange := "clearSky.events"
+	exchange := "clearsky.commands.v1"
 	routingKey := "institution.registered"
 
 	log.Printf("… Declaring exchange %q", exchange)
@@ -75,16 +75,18 @@ func main() {
 	failOnErr(err, "Failed to declare exchange")
 	log.Printf("✅ Exchange %q declared", exchange)
 
-	log.Printf("… Declaring queue %q", routingKey)
-	q, err := ch.QueueDeclare(
-		routingKey, // queue name == routing key
-		true,       // durable
-		false,      // delete when unused
-		false,      // exclusive
-		false,      // no-wait
-		nil,        // args
-	)
+	queueName := "clearsky.registration.commands.v1"
+	if err := ch.ExchangeDeclare("clearsky.dlx.v1", "direct", true, false, false, false, nil); err != nil {
+		failOnErr(err, "Failed to declare dead-letter exchange")
+	}
+	args := amqp.Table{"x-dead-letter-exchange": "clearsky.dlx.v1", "x-dead-letter-routing-key": queueName + ".dead"}
+	log.Printf("… Declaring queue %q", queueName)
+	q, err := ch.QueueDeclare(queueName, true, false, false, false, args)
 	failOnErr(err, "Failed to declare queue")
+	_, err = ch.QueueDeclare(queueName+".dlq", true, false, false, false, nil)
+	failOnErr(err, "Failed to declare DLQ")
+	err = ch.QueueBind(queueName+".dlq", queueName+".dead", "clearsky.dlx.v1", false, nil)
+	failOnErr(err, "Failed to bind DLQ")
 	log.Printf("✅ Queue %q declared", q.Name)
 
 	log.Printf("… Binding queue %q to exchange %q with routing key %q", q.Name, exchange, routingKey)

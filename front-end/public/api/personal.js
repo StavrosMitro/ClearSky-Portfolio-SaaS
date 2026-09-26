@@ -6,7 +6,7 @@ import { request } from './_request.js';
  * Orchestrator: GET /personal/grades → { status, data: […] }
  */
 export const getStudentCourses = async () => {
-  const { data } = await request('/personal/grades');
+  const data = await request('/personal/grades');
   return Array.isArray(data) ? data : [];
 };
 
@@ -20,6 +20,6 @@ export const getPersonalGrades = async ({ course_id, exam_period }) => {
   if (exam_period) qs.append('exam_period', exam_period);
 
   const suffix = qs.toString() ? `?${qs}` : '';
-  const { data } = await request(`/personal/grades${suffix}`);
+  const data = await request(`/personal/grades${suffix}`);
   return Array.isArray(data) ? data : [];
 };

@@ -3,6 +3,12 @@ const amqp = require('amqplib');
 const mysql = require('mysql2/promise');
 const XLSX = require('xlsx');
 
+const rpcOK = data => ({ version: 1, data });
+const rpcError = (code, message, retryable = false) => ({
+  version: 1,
+  error: { code, message, retryable }
+});
+
 const {
   MYSQL_URI,
   RABBITMQ_URI,
@@ -42,6 +48,7 @@ const log = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
     conn = await amqp.connect(RABBITMQ_URI);
     channel = await conn.createChannel();
     await channel.assertExchange(RABBITMQ_EXCHANGE, 'direct', { durable: true });
+    await channel.assertExchange('clearsky.dlx.v1', 'direct', { durable: true });
     log('✅ Connected to RabbitMQ and exchange set');
   } catch (err) {
     log('❌ RabbitMQ connection/setup failed:', err.message);
@@ -66,16 +73,38 @@ const log = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
     }
   };
 
+  const handleGradeLookup = async msg => {
+    const reply = makeReply(msg);
+    try {
+      const body = JSON.parse(msg.content.toString());
+      const am = ((body.AM || body.student_id) || '').trim();
+      if (!am) throw new Error('INVALID_STUDENT_ID');
+      const [rows] = await connection.execute(
+        'SELECT declarationPeriod, classTitle, grading_status, grade FROM grading WHERE AM = ?', [am]
+      );
+      reply(rpcOK(rows));
+      channel.ack(msg);
+    } catch (err) {
+      const invalid = err.message === 'INVALID_STUDENT_ID' || err instanceof SyntaxError;
+      reply(rpcError(invalid ? 'INVALID_REQUEST' : 'DEPENDENCY_UNAVAILABLE', invalid ? 'Student ID is required' : 'Grade store is unavailable', !invalid));
+      channel.nack(msg, false, false);
+    }
+  };
+
   // ───────────────────────────────────────────────────────────────────────────
   // 1️⃣ Grade Import via XLSX
-  const importQueue = 'postgrades.final';
-  await channel.assertQueue(importQueue, { durable: true, exclusive: false, autoDelete: false });
+  const importQueue = 'clearsky.personal-grades.commands.v1';
+  await channel.assertQueue(importQueue, { durable: true, arguments: { 'x-dead-letter-exchange': 'clearsky.dlx.v1', 'x-dead-letter-routing-key': 'clearsky.personal-grades.commands.v1.dead' } });
+  await channel.assertQueue('clearsky.personal-grades.commands.v1.dlq', { durable: true });
+  await channel.bindQueue('clearsky.personal-grades.commands.v1.dlq', 'clearsky.dlx.v1', 'clearsky.personal-grades.commands.v1.dead');
   await channel.bindQueue(importQueue, RABBITMQ_EXCHANGE, RABBITMQ_ROUTING_KEY);
+  await channel.bindQueue(importQueue, RABBITMQ_EXCHANGE, RABBITMQ_GET_GRADES_KEY);
   channel.prefetch(10);
   log(`🚀 Listening for XLSX uploads on "${RABBITMQ_ROUTING_KEY}"`);
 
   channel.consume(importQueue, async msg => {
     if (!msg) return;
+    if (msg.fields.routingKey === RABBITMQ_GET_GRADES_KEY) return handleGradeLookup(msg);
     log('📩 Received XLSX grade message');
     const reply = makeReply(msg);
 
@@ -147,69 +176,15 @@ const log = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
       }
 
       log(`🎉 Imported total of ${totalInserted} grades`);
-      reply({ status: 'ok', message: `Processed ${totalInserted} grades` });
+      reply(rpcOK({ message: `Processed ${totalInserted} grades` }));
       channel.ack(msg);
     } catch (err) {
       log('❌ Error importing grades:', err.message);
-      reply({ status: 'error', message: err.message });
+      const invalid = err.message === 'Template too short';
+      reply(rpcError(invalid ? 'INVALID_REQUEST' : 'INTERNAL_ERROR', invalid ? 'Invalid grade workbook' : 'Could not import grades', !invalid));
       channel.nack(msg, false, false);
     }
   }, { noAck: false });
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // 2️⃣ Query Grades by AM
-  const getGradesQueue = 'grades.get.byAM.q';
-  await channel.assertQueue(getGradesQueue, { durable: true, exclusive: false, autoDelete: false });
-  await channel.bindQueue(getGradesQueue, RABBITMQ_EXCHANGE, RABBITMQ_GET_GRADES_KEY);
-  log(`🎓 Listening for grade queries on "${RABBITMQ_GET_GRADES_KEY}"`);
-
-  channel.consume(getGradesQueue, async (msg) => {
-    if (!msg) return;
-    log('📩 Received AM query message');
-
-    // ─── RAW PAYLOAD ─────────────────────────────────────────────────────
-    const raw = msg.content.toString();
-    log(`📥 [getGrades] raw message: ${raw}`);
-
-    // ─── PARSED BODY ─────────────────────────────────────────────────────
-    let body;
-    try {
-      body = JSON.parse(raw);
-      log('📥 [getGrades] parsed body:', body);
-    } catch (e) {
-      log('❌ [getGrades] JSON parse error:', e.message);
-      const reply = makeReply(msg);
-      reply({ status: 'error', error: 'Invalid JSON' });
-      return channel.nack(msg, false, false);
-    }
-
-    const reply = makeReply(msg);
-
-    try {
-      // Accept either body.AM or body.student_id depending on what your Go service sends
-      const am = ((body.AM || body.student_id) || '').trim();
-
-      if (!am) {
-        log('⚠️ AM is missing from request');
-        throw new Error('Missing AM in request');
-      }
-
-      log(`🔍 Looking up grades for AM=${am}`);
-      const [rows] = await connection.execute(
-        `SELECT declarationPeriod, classTitle, grading_status, grade
-           FROM grading
-          WHERE AM = ?`,
-        [am]
-      );
-
-      log(`📤 Found ${rows.length} grade(s) for AM ${am}`);
-      reply({ status: 'ok', data: rows });
-      channel.ack(msg);
-    } catch (err) {
-      log('❌ Failed to handle AM request:', err.message);
-      reply({ status: 'error', error: err.message });
-      channel.nack(msg, false, false);
-    }
-  }, { noAck: false });
 
 })();

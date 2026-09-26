@@ -1,23 +1,32 @@
-// auth/signup.js
-import { flash } from '../../script.js';
-import { registerUser } from '../../api/users.js';
+// auth/signup.js – roster-verified student registration (step 1 of 2)
+import { requestStudentRegistration } from '../../api/users.js';
 
-const form = document.querySelector('main form');
+const form   = document.querySelector('#signup-form');
+const status = document.querySelector('#signup-status');
+
+function show(message, isError) {
+  status.textContent   = message;
+  status.style.color   = isError ? '#c00' : '#006400';
+  status.style.display = 'block';
+}
 
 form.addEventListener('submit', async e => {
   e.preventDefault();
-  const role     = form.role.value;
-  const username = form.username.value.trim();
-  const password = form.password.value;
-
-  if (!username || !password) {
-    return flash('Username and password are required');
+  const student_id = form.student_id.value.trim();
+  const email      = form.email.value.trim();
+  if (!student_id || !email) {
+    return show('Student ID and university email are required', true);
   }
+
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
   try {
-    await registerUser({ username, password, role });
-    flash('Signup successful! Redirecting to login…');
-    setTimeout(() => (window.location.href = '/login'), 1500);
+    await requestStudentRegistration({ student_id, email });
+    form.reset();
+    show('Check your university inbox: we sent you a confirmation link (valid for 24 hours).', false);
   } catch (err) {
-    flash(`Error: ${err.message}`);
+    show(err.message, true);
+  } finally {
+    button.disabled = false;
   }
 });

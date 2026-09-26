@@ -40,13 +40,8 @@ func main() {
 	failOnErr(err, "Failed to open channel")
 	defer ch.Close()
 
-	exchange := "clearSky.events"
-	keys := []string{
-		"credits.spent",
-		"credits.purchased",
-		"credits.avail",
-		"add.new",
-	}
+	exchange := "clearsky.commands.v1"
+	keys := []string{"credits.avail", "credits.spent", "credits.purchased", "add.new"}
 
 	err = ch.ExchangeDeclare(
 		exchange,
@@ -59,15 +54,17 @@ func main() {
 	)
 	failOnErr(err, "Failed to declare exchange")
 
-	q, err := ch.QueueDeclare(
-		"credits_queue", // queue name
-		true,            // durable
-		false,           // delete when unused
-		false,           // exclusive
-		false,           // no-wait
-		nil,             // args
-	)
+	queueName := "clearsky.credits.commands.v1"
+	if err := ch.ExchangeDeclare("clearsky.dlx.v1", "direct", true, false, false, false, nil); err != nil {
+		failOnErr(err, "Failed to declare dead-letter exchange")
+	}
+	args := amqp.Table{"x-dead-letter-exchange": "clearsky.dlx.v1", "x-dead-letter-routing-key": queueName + ".dead"}
+	q, err := ch.QueueDeclare(queueName, true, false, false, false, args)
 	failOnErr(err, "Failed to declare queue")
+	_, err = ch.QueueDeclare(queueName+".dlq", true, false, false, false, nil)
+	failOnErr(err, "Failed to declare DLQ")
+	err = ch.QueueBind(queueName+".dlq", queueName+".dead", "clearsky.dlx.v1", false, nil)
+	failOnErr(err, "Failed to bind DLQ")
 
 	for _, key := range keys { //creating 3 bind, 1 per routing key
 		if err := ch.QueueBind(

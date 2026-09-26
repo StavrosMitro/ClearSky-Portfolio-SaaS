@@ -16,41 +16,31 @@ type BuyReq struct {
 	Amount int    `json:"amount"`
 }
 
-type BuyResponse struct {
-	Status      string `json:"status"`          // "ok" or "error"
-	Message     string `json:"message"`         // human-readable
-	ErrorDetail string `json:"error,omitempty"` // optional, for debugging
-}
-
 func HandleBuy(d amqp.Delivery, ch *amqp.Channel) {
 	var req BuyReq
 
 	if err := json.Unmarshal(d.Body, &req); err != nil {
 		log.Printf("Invalid JSON received: %v", err)
-		sendBuyReplyAndNack(ch, d, BuyResponse{
-			Status:      "error",
-			Message:     "Invalid JSON format",
-			ErrorDetail: err.Error(),
-		}, false)
+		sendBuyReplyAndNack(ch, d, rpcFailure("INVALID_REQUEST", "A valid purchase request is required", false), false)
+		return
+	}
+	if req.Name == "" || req.Amount <= 0 {
+		sendBuyReplyAndNack(ch, d, rpcFailure("INVALID_REQUEST", "A valid institution and positive amount are required", false), false)
 		return
 	}
 
 	success, err := dbService.BuyCredits(req.Name, req.Amount)
 	if err != nil {
 		log.Printf("DB error during BuyCredits: %v", err)
-		sendBuyReplyAndNack(ch, d, BuyResponse{
-			Status:      "error",
-			Message:     "Could not process purchase",
-			ErrorDetail: err.Error(),
-		}, true)
+		sendBuyReplyAndNack(ch, d, rpcFailure("DEPENDENCY_UNAVAILABLE", "Credits store is unavailable", true), true)
 		return
 	}
 
-	var res BuyResponse
+	var res RPCEnvelope
 	if success {
-		res = BuyResponse{Status: "ok", Message: "Credits purchased successfully"}
+		res = rpcSuccess(map[string]string{"message": "Credits purchased successfully"})
 	} else {
-		res = BuyResponse{Status: "error", Message: "Unknown error occurred during purchase"}
+		res = rpcFailure("CONFLICT", "Credits could not be purchased", false)
 	}
 
 	if err := publishBuyReply(ch, d, res); err != nil {
@@ -61,14 +51,14 @@ func HandleBuy(d amqp.Delivery, ch *amqp.Channel) {
 	d.Ack(false)
 }
 
-func sendBuyReplyAndNack(ch *amqp.Channel, d amqp.Delivery, res BuyResponse, requeue bool) {
+func sendBuyReplyAndNack(ch *amqp.Channel, d amqp.Delivery, res RPCEnvelope, requeue bool) {
 	if err := publishBuyReply(ch, d, res); err != nil {
 		log.Printf("Failed to publish error response: %v", err)
 	}
 	d.Nack(false, requeue)
 }
 
-func publishBuyReply(ch *amqp.Channel, d amqp.Delivery, res BuyResponse) error {
+func publishBuyReply(ch *amqp.Channel, d amqp.Delivery, res RPCEnvelope) error {
 	if d.ReplyTo == "" {
 		return nil
 	}

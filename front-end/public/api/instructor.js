@@ -44,7 +44,7 @@ export const getPendingReviews = async (filters = {}) => {
   
   console.log('[DEBUG] 🟡 Response from /instructor/review-list:', res);
 
-  return res?.data?.data ?? res?.data ?? res;
+  return res?.data ?? res;
 };
 
 /**

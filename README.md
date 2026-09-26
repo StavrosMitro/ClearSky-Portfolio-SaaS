@@ -102,7 +102,12 @@ For google auth, you need to set yourself the .env.
 - Each microservice requires its own `.env` file.  
   Copy `.env.example` or create a `.env` in each service directory.
 - Set environment variables for database connections, RabbitMQ, Google OAuth, and JWT secrets.
-- For Google Auth: set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`, `JWT_SECRET`.
+- For Google Auth: set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`, `INTERNAL_AUTH_TOKEN`.
+- The root stack requires `JWT_SECRET`, `INTERNAL_AUTH_TOKEN` and `SESSION_SECRET` (32+ characters each)
+  and the RabbitMQ account `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`.
+  Copy the root `.env.example` to `.env`; see [docs/auth-cutover.md](docs/auth-cutover.md).
+- Google login needs `GOOGLE_ALLOWED_DOMAINS` (the university email domains). Student and instructor
+  onboarding is described in [docs/account-onboarding.md](docs/account-onboarding.md).
 
 ### 3. Build & Launch
 
@@ -124,7 +129,8 @@ docker compose up --build -d
 
 - **Front-end Web UI:** [http://localhost:3000](http://localhost:3000)
 - **Orchestrator API:** [http://localhost:8080](http://localhost:8080)
-- **RabbitMQ UI:** [http://localhost:15673](http://localhost:15673) (guest/guest)
+- **Mailpit (development email inbox):** [http://127.0.0.1:8025](http://127.0.0.1:8025)
+- **RabbitMQ:** internal to the Docker network only; see [docs/auth-cutover.md](docs/auth-cutover.md) for temporary UI access
 
 ### 5. Database Ports
 
@@ -157,11 +163,9 @@ docker compose up --build -d
   ```
 - Database access:  
   Use `psql`, `mysql`, or `mongo` CLI tools to connect to the respective DB containers.
-- Initial user:
-    username: admin
-    password: admin
-  Then you can create your roles.
-  There is only one issue, we havent integrated the role of the Institution Representative into JWT body.
+- Initial user: none is created automatically. Set `BOOTSTRAP_ADMIN_USERNAME` and
+  `BOOTSTRAP_ADMIN_PASSWORD` (12+ characters) before the first start to create an
+  institution representative. See [docs/auth-cutover.md](docs/auth-cutover.md).
 
 - Common issues:
   - **"relation ... does not exist"**: DB init script did not run. Remove volumes and restart.

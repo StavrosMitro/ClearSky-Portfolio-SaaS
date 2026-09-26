@@ -40,42 +40,33 @@ func Init() {
 		log.Fatalf("RabbitMQ channel: %v", err)
 	}
 
-	// 1) Declare the orchestrator.commands exchange for RPC commands
-	if err := Channel.ExchangeDeclare(
-		"orchestrator.commands", "topic", true, false, false, false, nil,
-	); err != nil {
-		log.Fatalf("Declare orchestrator.commands: %v", err)
+	// Versioned topology. Old broker resources are intentionally not touched.
+	if err := Channel.ExchangeDeclare("clearsky.commands.v1", "direct", true, false, false, false, nil); err != nil {
+		log.Fatalf("Declare command exchange: %v", err)
 	}
-
-	// 2) Declare the clearSky.events exchange for publishing domain events
-	if err := Channel.ExchangeDeclare(
-		"clearSky.events", "direct", true, false, false, false, nil,
-	); err != nil {
-		log.Fatalf("Declare clearSky.events: %v", err)
+	if err := Channel.ExchangeDeclare("clearsky.events.v1", "topic", true, false, false, false, nil); err != nil {
+		log.Fatalf("Declare event exchange: %v", err)
 	}
-
-	// 3) Declare and bind the auth.request queue to orchestrator.commands
-	queue := "auth.request"
-	if _, err := Channel.QueueDeclare(queue, true, false, false, false, nil); err != nil {
+	if err := Channel.ExchangeDeclare("clearsky.dlx.v1", "direct", true, false, false, false, nil); err != nil {
+		log.Fatalf("Declare dead-letter exchange: %v", err)
+	}
+	queue := "clearsky.auth.commands.v1"
+	args := amqp.Table{"x-dead-letter-exchange": "clearsky.dlx.v1", "x-dead-letter-routing-key": queue + ".dead"}
+	if _, err := Channel.QueueDeclare(queue, true, false, false, false, args); err != nil {
 		log.Fatalf("QueueDeclare %s: %v", queue, err)
 	}
-	for _, key := range []string{"auth.register", "auth.login", "auth.delete", "auth.change_password"} {
-		if err := Channel.QueueBind(queue, key, "orchestrator.commands", false, nil); err != nil {
-			log.Fatalf("QueueBind %s → %s: %v", queue, key, err)
-		}
+	if _, err := Channel.QueueDeclare(queue+".dlq", true, false, false, false, nil); err != nil {
+		log.Fatalf("QueueDeclare DLQ %s: %v", queue, err)
 	}
-
-	// 4) Declare and bind the queue for login/register
-	for _, key := range []string{"user.login", "user.register"} {
-		if err := Channel.QueueBind(
-			queue, key, "clearSky.events", false, nil,
-		); err != nil {
-			log.Fatalf("QueueBind %s: %v", key, err)
-		}
+	if err := Channel.QueueBind(queue+".dlq", queue+".dead", "clearsky.dlx.v1", false, nil); err != nil {
+		log.Fatalf("QueueBind DLQ %s: %v", queue, err)
+	}
+	if err := Channel.QueueBind(queue, "auth.request", "clearsky.commands.v1", false, nil); err != nil {
+		log.Fatalf("QueueBind %s: %v", queue, err)
 	}
 }
 
-// PublishEvent στέλνει ένα event στο clearSky.events με το δοσμένο routingKey
+// PublishEvent στέλνει ένα event στο clearsky.events.v1 με το δοσμένο routingKey
 func PublishEvent(routingKey string, payload interface{}) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -83,12 +74,13 @@ func PublishEvent(routingKey string, payload interface{}) {
 		return
 	}
 	err = Channel.Publish(
-		"clearSky.events", // exchange (fixed name)
-		routingKey,        // routing key
+		"clearsky.events.v1",
+		routingKey, // routing key
 		false, false,
 		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Body:         body,
 		},
 	)
 	if err != nil {

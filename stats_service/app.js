@@ -3,6 +3,12 @@ const amqp = require('amqplib');
 const mysql = require('mysql2/promise');
 const XLSX = require('xlsx');
 
+const rpcOK = data => ({ version: 1, data });
+const rpcError = (code, message, retryable = false) => ({
+  version: 1,
+  error: { code, message, retryable }
+});
+
 /* const {
   MYSQL_URI,
   RABBITMQ_URI,
@@ -55,6 +61,7 @@ if (missingVars.length > 0) {
     conn = await amqp.connect(RABBITMQ_URI);
     channel = await conn.createChannel();
     await channel.assertExchange(RABBITMQ_EXCHANGE, 'direct', { durable: true });
+    await channel.assertExchange('clearsky.dlx.v1', 'direct', { durable: true });
     console.log('✅  Connected to RabbitMQ and exchange set');
   } catch (err) {
     console.error('❌ RabbitMQ connection/setup failed:', err.message);
@@ -75,14 +82,49 @@ if (missingVars.length > 0) {
     }
   };
 
-   const q = 'postgrades.final';
-  await channel.assertQueue(q, { durable: true, exclusive: false, autoDelete: false });
+  const handleSubmissionLog = async msg => {
+    const reply = makeReply(msg);
+    try {
+      const [rows] = await connection.execute('SELECT * FROM submission_log');
+      reply(rpcOK(rows));
+      channel.ack(msg);
+    } catch (err) {
+      reply(rpcError('DEPENDENCY_UNAVAILABLE', 'Statistics store is unavailable', true));
+      channel.nack(msg, false, false);
+    }
+  };
+  const handleGradeQuery = async msg => {
+    const reply = makeReply(msg);
+    try {
+      const params = JSON.parse(msg.content.toString());
+      const { declarationPeriod, classTitle } = params;
+      if (!declarationPeriod || !classTitle) throw new Error('INVALID_QUERY');
+      const dims = ['grade', 'Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7', 'Q8', 'Q9', 'Q10'];
+      const result = {};
+      for (const dim of dims) result[dim] = await fetchHistogram(dim, connection, params);
+      reply(rpcOK(result));
+      channel.ack(msg);
+    } catch (err) {
+      const invalid = err.message === 'INVALID_QUERY' || err instanceof SyntaxError;
+      reply(rpcError(invalid ? 'INVALID_REQUEST' : 'DEPENDENCY_UNAVAILABLE', invalid ? 'Declaration period and class title are required' : 'Statistics store is unavailable', !invalid));
+      channel.nack(msg, false, false);
+    }
+  };
+
+   const q = 'clearsky.stats.commands.v1';
+  await channel.assertQueue(q, { durable: true, arguments: { 'x-dead-letter-exchange': 'clearsky.dlx.v1', 'x-dead-letter-routing-key': 'clearsky.stats.commands.v1.dead' } });
+  await channel.assertQueue('clearsky.stats.commands.v1.dlq', { durable: true });
+  await channel.bindQueue('clearsky.stats.commands.v1.dlq', 'clearsky.dlx.v1', 'clearsky.stats.commands.v1.dead');
   await channel.bindQueue(q, RABBITMQ_EXCHANGE, RABBITMQ_ROUTING_KEY);
+  await channel.bindQueue(q, RABBITMQ_EXCHANGE, RABBITMQ_SEND_AVAIL_KEY);
+  await channel.bindQueue(q, RABBITMQ_EXCHANGE, RABBITMQ_GET_GRADES_KEY);
   channel.prefetch(10);
   console.log(`🚀  Listening for grades on "${RABBITMQ_ROUTING_KEY}"`);
 
   channel.consume(q, async msg => {
     if (!msg) return;
+    if (msg.fields.routingKey === RABBITMQ_SEND_AVAIL_KEY) return handleSubmissionLog(msg);
+    if (msg.fields.routingKey === RABBITMQ_GET_GRADES_KEY) return handleGradeQuery(msg);
     console.log('📩  Received grade message');
     const reply = makeReply(msg);
 
@@ -182,37 +224,16 @@ if (missingVars.length > 0) {
       
 
       console.log(`✅  Processed ${totalInserted} grades`);
-      reply({ status: 'ok', message: `Processed ${totalInserted} grades` });
+      reply(rpcOK({ message: `Processed ${totalInserted} grades` }));
       channel.ack(msg);
 
     } catch (err) {
       console.error('❌ Error processing grades:', err.message);
-      reply({ status: 'error', message: err.message });
+      const invalid = err.message === 'Template too short';
+      reply(rpcError(invalid ? 'INVALID_REQUEST' : 'INTERNAL_ERROR', invalid ? 'Invalid grade workbook' : 'Could not process grades', !invalid));
       channel.nack(msg, false, false);
     }
   }, { noAck: false });
-  {
-    const q2 = 'get.submission.logs';
-    await channel.assertQueue(q2, { durable: false, exclusive: false, autoDelete: false });
-    await channel.bindQueue(q2, RABBITMQ_EXCHANGE, RABBITMQ_SEND_AVAIL_KEY);
-    console.log(`📥  Listening for submission-log requests on "${RABBITMQ_SEND_AVAIL_KEY}"`);
-
-    channel.consume(q2, async msg => {
-      if (!msg) return;
-      console.log('📩  Received submission-log request');
-      const reply = makeReply(msg);
-
-      try {
-        const [rows] = await connection.execute(`SELECT * FROM submission_log`);
-        reply({ status: 'ok', data: rows });
-        channel.ack(msg);
-      } catch (err) {
-        console.error('❌ Error fetching submission logs:', err.message);
-        reply({ status: 'error', message: err.message });
-        channel.nack(msg, false, false);
-      }
-    }, { noAck: false });
-  }
 
 // -- histogram helper with dynamic upper‐bound on bins --
 async function fetchHistogram(field, connection, { classTitle, declarationPeriod }) {
@@ -247,51 +268,5 @@ async function fetchHistogram(field, connection, { classTitle, declarationPeriod
 }
 
 
-// -- RabbitMQ consumer that calls fetchHistogram for each dimension --
-{
-  const q3 = 'get.grades';
-  await channel.assertQueue(q3, { durable: false, exclusive: false, autoDelete: false });
-  await channel.bindQueue(q3, RABBITMQ_EXCHANGE, RABBITMQ_GET_GRADES_KEY);
-  console.log(`📥  Listening for grade-fetch requests on "${RABBITMQ_GET_GRADES_KEY}"`);
 
-  channel.consume(q3, async msg => {
-    if (!msg) return;
-    console.log('📩  Received get.grades request');
-    const reply = makeReply(msg);
-
-    let params;
-    try {
-      params = JSON.parse(msg.content.toString());
-    } catch (err) {
-      console.error('❌ Invalid JSON payload:', err.message);
-      reply({ status: 'error', message: 'Invalid JSON payload' });
-      return channel.nack(msg, false, false);
-    }
-
-    const { declarationPeriod, classTitle } = params;
-    if (!declarationPeriod || !classTitle) {
-      const missing = ['declarationPeriod', 'classTitle']
-        .filter(k => !params[k]).join(', ');
-      reply({ status: 'error', message: `Missing fields: ${missing}` });
-      return channel.ack(msg);
-    }
-
-    try {
-      // Build histograms for total grade + Q1–Q10
-      const dims = ['grade', 'Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7', 'Q8', 'Q9', 'Q10'];
-      const result = {};
-      for (let dim of dims) {
-        result[dim] = await fetchHistogram(dim, connection, params);
-      }
-
-      reply({ status: 'ok', data: result });
-      channel.ack(msg);
-
-    } catch (err) {
-      console.error('❌ Error fetching grade histograms:', err.message);
-      reply({ status: 'error', message: err.message });
-      channel.nack(msg, false, false);
-    }
-  }, { noAck: false });
-}
 })();

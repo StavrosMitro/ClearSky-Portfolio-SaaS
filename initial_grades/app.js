@@ -8,6 +8,12 @@ const mongoose       = require('mongoose');
 const { MongoClient } = require('mongodb');
 const XLSX           = require('xlsx');
 
+const rpcOK = data => ({ version: 1, data });
+const rpcError = (code, message, retryable = false) => ({
+  version: 1,
+  error: { code, message, retryable }
+});
+
 
 
 /* const {
@@ -84,6 +90,7 @@ if (missingVars.length > 0) {
     conn = await amqp.connect(RABBITMQ_URI);
     channel = await conn.createChannel();
     await channel.assertExchange(RABBITMQ_EXCHANGE, 'direct', { durable: true });
+    await channel.assertExchange('clearsky.dlx.v1', 'direct', { durable: true });
     console.log('✅  Connected to RabbitMQ and exchange set');
   } catch (err) {
     console.error('❌ RabbitMQ connection/setup failed:', err.message);
@@ -109,7 +116,9 @@ if (missingVars.length > 0) {
 
   // ─── Listener 1: Grades
   {
-    const q1 = await channel.assertQueue('', { exclusive: true });
+    const q1 = await channel.assertQueue('clearsky.initial-grades.commands.v1', { durable: true, arguments: { 'x-dead-letter-exchange': 'clearsky.dlx.v1', 'x-dead-letter-routing-key': 'clearsky.initial-grades.commands.v1.dead' } });
+    await channel.assertQueue('clearsky.initial-grades.commands.v1.dlq', { durable: true });
+    await channel.bindQueue('clearsky.initial-grades.commands.v1.dlq', 'clearsky.dlx.v1', 'clearsky.initial-grades.commands.v1.dead');
     await channel.bindQueue(q1.queue, RABBITMQ_EXCHANGE, RABBITMQ_ROUTING_KEY);
     channel.prefetch(10);
     console.log(`🚀  Listening for grades on "${RABBITMQ_ROUTING_KEY}"`);
@@ -162,12 +171,13 @@ if (missingVars.length > 0) {
         });
         const res = await Grade.insertMany(docs, { ordered: false });
         console.log(`✅  Inserted ${res.length} grades`);
-        reply({ status: 'ok', message: `Inserted ${res.length}` });
+        reply(rpcOK({ message: `Inserted ${res.length}` }));
         channel.ack(msg);
 
       } catch (err) {
         console.error('❌ Error processing grades:', err.message);
-        reply({ status: 'error', message: err.message });
+        const invalid = err.message === 'Template too short';
+        reply(rpcError(invalid ? 'INVALID_REQUEST' : 'INTERNAL_ERROR', invalid ? 'Invalid grade workbook' : 'Could not import grades', !invalid));
         channel.nack(msg, false, false);
       }
     }, { noAck: false });

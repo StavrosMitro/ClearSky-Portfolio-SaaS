@@ -1,7 +1,9 @@
 package controllers
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"instructor_review_reply_service/db"
 )
@@ -49,11 +51,10 @@ func GetRequestInfo(body map[string]interface{}) (string, error) {
 		&review.Review_created_at,
 	)
 	if err != nil {
-		emptyResponse := map[string]interface{}{
-			"message": "No review found for the given input.",
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("review not found")
 		}
-		respBytes, _ := json.Marshal(emptyResponse)
-		return string(respBytes), nil
+		return "", fmt.Errorf("failed to read review")
 	}
 	resBytes, _ := json.Marshal(review)
 	return string(resBytes), nil

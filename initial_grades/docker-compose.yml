@@ -8,7 +8,7 @@ services:
     environment:
       - MONGO_URI=mongodb://mongo:27017/ingradesdb
       - RABBITMQ_URI=amqp://rabbitmq:5672
-      - RABBITMQ_EXCHANGE=clearSky.events
+      - RABBITMQ_EXCHANGE=clearsky.commands.v1
       - RABBITMQ_ROUTING_KEY=postgrades.init
       - RABBITMQ_CREDIT_INCR_KEY=incr.credits
       - MONGO_USER=root

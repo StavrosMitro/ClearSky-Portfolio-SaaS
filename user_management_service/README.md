@@ -12,21 +12,25 @@ This microservice handles user authentication and authorization for the clearSKY
 
 ## Supported Features
 
-### REST API Endpoints
+### Internal HTTP Endpoints
 
-| Endpoint         | Method | Description                  |
-|------------------|--------|------------------------------|
-| `/register`      | POST   | Register a new user          |
-| `/login`         | POST   | Authenticate user and issue a JWT |
-| `/auth/validate` | GET    | Validate a JWT via middleware |
+The HTTP port is internal to the Compose network; the orchestrator is the public API.
+
+| Endpoint                 | Method | Description |
+|--------------------------|--------|-------------|
+| `/internal/google-login` | POST   | Exchange an email already verified by Google auth for an application JWT. Requires `Authorization: Bearer $INTERNAL_AUTH_TOKEN`. |
+| `/auth/validate`         | GET    | Validate a JWT via middleware |
+| `/auth/profile`          | GET    | Return the authenticated user's profile |
 
 ### RabbitMQ Messaging
 
-- **Queue:** `auth.request`
-- **Exchange:** `orchestrator.commands` (topic)
-- **Bindings:** `auth.register`, `auth.login`
+- **Exchange:** `clearsky.commands.v1` (direct)
+- **Queue:** `clearsky.auth.commands.v1`, bound with routing key `auth.request`
+- **Request types:** `login`, `change_password`, `google_login`, `request_student_activation`,
+  `complete_activation`, `complete_google_signup`, and (representatives only, with `actor_token`)
+  `create_instructor`, `import_student_roster`. See `docs/account-onboarding.md`.
 - **Reply Queue:** Defined by the `reply_to` field in the request
-- **Correlation ID:** Supported for message tracking
+- **Correlation ID:** Copied from the request
 
 #### Sample Request (RabbitMQ)
 
@@ -40,19 +44,29 @@ This microservice handles user authentication and authorization for the clearSKY
 
 #### Sample Response
 
+Replies use the v1 envelope described in `docs/service-contracts.md`:
+
 ```json
-{
-  "status": "ok",
-  "token": "<jwt_token_here>",
-  "role": "student"
-}
+{"version":1,"data":{"token":"<jwt_token_here>","role":"student","user_id":"<uuid>"}}
 ```
 
-## Orchestrator Integration
+```json
+{"version":1,"error":{"code":"INVALID_CREDENTIALS","message":"Invalid credentials","retryable":false}}
+```
 
-- The service listens on the `auth.request` queue for messages with routing keys `auth.register` and `auth.login` from the `orchestrator.commands` exchange.
-- It replies to the `reply_to` queue with the same `correlation_id` for RPC-style communication with the orchestrator.
-- Make sure the orchestrator and this service use the same RabbitMQ instance and exchange/queue names.
+## Configuration
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JWT_SECRET` | yes | HS256 signing key, 32+ characters, shared with the orchestrator |
+| `INTERNAL_AUTH_TOKEN` | yes | Shared secret for `/internal/google-login`, 32+ characters |
+| `JWT_ISSUER` / `JWT_AUDIENCE` | no | Default `clearsky-identity` / `clearsky-api` |
+| `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` | no | Set both to create a first institution representative (password 12+ characters). No account is created otherwise. |
+| `DATABASE_DSN` | no | SQLite file, default `auth_service.db` |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` | for email | SMTP relay for confirmation links and invitations; unset disables them |
+| `PUBLIC_APP_URL` | no | Front-end base URL used in emailed links, default `http://localhost:3000` |
+
+See `docs/auth-cutover.md` for deployment and remediation steps.
 
 ## Execution Instructions (Dockerized)
 
@@ -64,7 +78,6 @@ docker-compose up --build
 ```
 
 3. Access Points:
-   - API Service: http://localhost:8082
    - RabbitMQ Management UI: http://localhost:15672
      - Username: `guest`
      - Password: `guest`
@@ -102,7 +115,7 @@ user_management_service/
 
 | Feature                      | Status |
 |-----------------------------|--------|
-| User registration with role | Done   |
+| Student registration        | Done   |
 | JWT-based login             | Done   |
 | Token validation            | Done   |
 | RabbitMQ message handling   | Done   |

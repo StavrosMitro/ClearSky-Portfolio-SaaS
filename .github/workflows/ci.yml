@@ -1,0 +1,121 @@
+# Roadmap 2.1: every push and pull request builds and tests everything.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  go:
+    name: Go (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [contracts, orchestrator, identity_service, institutions_service, grades_ingest_service,
+                 grades_query_service, reviews_service, notifications_service, tools]
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3.13.7-management
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity" --health-interval 10s --health-timeout 10s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres?sslmode=disable
+      TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.8"
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: go vet ./... && go vet -tags e2e ./...
+      - name: go test
+        run: go test -race -count=1 ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  repository:
+    name: Repository checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml==6.0.2
+      - name: Compose, topology and OpenAPI contracts
+        run: python -m unittest discover -s tests -v
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: front-end/package-lock.json
+      - name: Front-end
+        working-directory: front-end
+        run: |
+          npm ci --omit=dev
+          npm audit --omit=dev --audit-level=high
+          node --check app.js
+          find public -name '*.js' -print0 | xargs -0 -n1 node --check
+
+  stack:
+    name: Stack (build, seed, end to end)
+    runs-on: ubuntu-latest
+    needs: [go, repository]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.8"
+          cache-dependency-path: tools/go.sum
+      - name: Generate .env
+        run: |
+          cp .env.example .env
+          for v in JWT_SECRET SESSION_SECRET RABBITMQ_DEFAULT_PASS IDENTITY_DB_PASSWORD INSTITUTIONS_DB_PASSWORD \
+                   GRADES_INGEST_DB_PASSWORD GRADES_QUERY_DB_PASSWORD REVIEWS_DB_PASSWORD NOTIFICATIONS_DB_PASSWORD \
+                   BOOTSTRAP_ADMIN_PASSWORD; do
+            sed -i "s/^$v=.*/$v=$(openssl rand -hex 24)/" .env
+          done
+          sed -i 's/^RABBITMQ_DEFAULT_USER=.*/RABBITMQ_DEFAULT_USER=clearsky/; s/^BOOTSTRAP_ADMIN_USERNAME=.*/BOOTSTRAP_ADMIN_USERNAME=secretariat/' .env
+          echo "SEED_PASSWORD=$(openssl rand -hex 12)" >> .env
+          docker compose config --quiet
+      - name: Build and start
+        run: docker compose up --build --detach --wait --wait-timeout 300
+      - name: Seed
+        working-directory: tools
+        run: set -a && . ../.env && set +a && go run ./cmd/seed -students 12
+      - name: End-to-end and failure tests
+        working-directory: tools
+        run: set -a && . ../.env && set +a && go test -tags e2e -count=1 -v ./e2e
+      - name: Logs on failure
+        if: failure()
+        run: docker compose ps && docker compose logs --no-color --tail 200
+      - name: Stop
+        if: always()
+        run: docker compose down -v

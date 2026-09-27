@@ -1,0 +1,12 @@
+{
+  "name": "clearsky-grade-characterization",
+  "private": true,
+  "description": "Captures how the legacy Node grade services parse workbooks and build histograms (roadmap 2.2).",
+  "scripts": {
+    "fixtures": "node generate-fixtures.js",
+    "capture": "node capture.js"
+  },
+  "dependencies": {
+    "xlsx": "0.18.5"
+  }
+}

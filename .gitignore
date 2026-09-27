@@ -33,3 +33,6 @@ dist/
 build/
 coverage/
 docs/
+
+# Local-only Compose overrides (e.g. database ports)
+docker-compose.override.yml

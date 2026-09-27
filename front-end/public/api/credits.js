@@ -1,21 +1,10 @@
-// credits.js
+// credits.js – the representative's institution credits (SRS 2.4)
 import { request } from './_request.js';
 
-/**
- * Purchase credits for a given institution.
- * @param {{ name: string, amount: number }} payload
- */
-export const purchaseCredits = ({ name, amount }) =>
-  request('/purchase', {
-    method: 'PATCH',
-    body: { name, amount }
-  });
+export const purchaseCredits = ({ amount }) =>
+  request('/purchase', { method: 'PATCH', body: { amount } });
 
-export const getMyCredits = () =>
-  request('/mycredits');
+/** The institution with its current credits. */
+export const getMyCredits = () => request('/mycredits');
 
-export const spendCredits = (amount, reason) =>
-  request('/spending', {
-    method: 'PATCH',
-    body: { amount, reason }
-  });
+export const getCreditHistory = () => request('/institution/credit-history');

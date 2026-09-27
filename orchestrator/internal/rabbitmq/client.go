@@ -1,9 +1,13 @@
 package rabbitmq
 
 import (
+	"clearsky/contracts/obs"
 	"context"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"log"
 	"orchestrator/internal/messaging"
 	"strconv"
@@ -29,24 +33,24 @@ type pending struct {
 	failure  chan error
 }
 
-// Client owns distinct channels for topology, confirms, replies, and events.
+// Client owns distinct channels for topology, confirms and replies.
 // Publishing is serialized because AMQP confirms are delivery-tag ordered per channel;
 // this keeps confirmation/return correlation bounded and cancellation-safe.
 type Client struct {
-	conn                                 *amqp.Connection
-	topology, publisher, replies, events *amqp.Channel
-	replyQueue                           string
-	requestTimeout                       time.Duration
-	slots                                chan struct{}
-	mu                                   sync.Mutex
-	pending                              map[string]*pending
-	publisherGate                        chan struct{}
-	returned                             <-chan amqp.Return
-	done                                 chan struct{}
-	unavailable                          chan struct{}
-	closeOnce                            sync.Once
-	unavailableOnce                      sync.Once
-	ready                                atomic.Bool
+	conn                         *amqp.Connection
+	topology, publisher, replies *amqp.Channel
+	replyQueue                   string
+	requestTimeout               time.Duration
+	slots                        chan struct{}
+	mu                           sync.Mutex
+	pending                      map[string]*pending
+	publisherGate                chan struct{}
+	returned                     <-chan amqp.Return
+	done                         chan struct{}
+	unavailable                  chan struct{}
+	closeOnce                    sync.Once
+	unavailableOnce              sync.Once
+	ready                        atomic.Bool
 }
 
 func New(url string, maxInFlight int, requestTimeout time.Duration) (*Client, error) {
@@ -97,12 +101,6 @@ func NewWithConnection(conn *amqp.Connection, maxInFlight int, requestTimeout ti
 		_ = c.topology.Close()
 		return nil, err
 	}
-	if c.events, err = conn.Channel(); err != nil {
-		_ = c.replies.Close()
-		_ = c.publisher.Close()
-		_ = c.topology.Close()
-		return nil, err
-	}
 	q, err := c.replies.QueueDeclare("", false, true, true, false, nil)
 	if err != nil {
 		_ = c.Close()
@@ -119,15 +117,13 @@ func NewWithConnection(conn *amqp.Connection, maxInFlight int, requestTimeout ti
 	go c.watchClose(c.topology.NotifyClose(make(chan *amqp.Error, 1)))
 	go c.watchClose(c.publisher.NotifyClose(make(chan *amqp.Error, 1)))
 	go c.watchClose(c.replies.NotifyClose(make(chan *amqp.Error, 1)))
-	go c.watchClose(c.events.NotifyClose(make(chan *amqp.Error, 1)))
-	go c.watchConsumerCancel(c.events.NotifyCancel(make(chan string, 1)))
+	go c.watchConsumerCancel(c.replies.NotifyCancel(make(chan string, 1)))
 	go c.watchClose(conn.NotifyClose(make(chan *amqp.Error, 1)))
 	return c, nil
 }
 
 func (c *Client) Ready() bool                    { return c != nil && c.ready.Load() }
 func (c *Client) Unavailable() <-chan struct{}   { return c.unavailable }
-func (c *Client) EventChannel() *amqp.Channel    { return c.events }
 func (c *Client) TopologyChannel() *amqp.Channel { return c.topology }
 
 func (c *Client) dispatchReplies(deliveries <-chan amqp.Delivery) {
@@ -232,7 +228,17 @@ func (c *Client) boundedContext(parent context.Context) (context.Context, contex
 	return context.WithTimeout(parent, c.requestTimeout)
 }
 
+// Call sends an RPC request and waits for its reply, inside a client span
+// whose context travels to the consumer in the AMQP headers.
 func (c *Client) Call(ctx context.Context, routingKey string, body []byte) ([]byte, error) {
+	ctx, span := startSpan(ctx, "rpc "+routingKey, routingKey)
+	defer span.End()
+	reply, err := c.call(ctx, routingKey, body)
+	recordError(span, err)
+	return reply, err
+}
+
+func (c *Client) call(ctx context.Context, routingKey string, body []byte) ([]byte, error) {
 	ctx, cancel := c.boundedContext(ctx)
 	defer cancel()
 	if err := c.acquire(ctx); err != nil {
@@ -269,7 +275,17 @@ func (c *Client) Call(ctx context.Context, routingKey string, body []byte) ([]by
 		return nil, ErrConnectionLost
 	}
 }
+
+// Send publishes a persistent message without waiting for a reply.
 func (c *Client) Send(ctx context.Context, routingKey string, body []byte) error {
+	ctx, span := startSpan(ctx, "publish "+routingKey, routingKey)
+	defer span.End()
+	err := c.send(ctx, routingKey, body)
+	recordError(span, err)
+	return err
+}
+
+func (c *Client) send(ctx context.Context, routingKey string, body []byte) error {
 	ctx, cancel := c.boundedContext(ctx)
 	defer cancel()
 	if err := c.acquire(ctx); err != nil {
@@ -313,6 +329,7 @@ func (c *Client) publish(ctx context.Context, routingKey string, body []byte, co
 			MessageId:     messageID,
 			ReplyTo:       replyTo,
 			Expiration:    expires,
+			Headers:       obs.InjectAMQP(ctx, nil),
 			Body:          body,
 		},
 	)
@@ -378,9 +395,6 @@ func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
 		c.markUnavailable(ErrClosed)
-		if c.events != nil {
-			_ = c.events.Close()
-		}
 		if c.replies != nil {
 			_ = c.replies.Close()
 		}
@@ -395,4 +409,16 @@ func (c *Client) Close() error {
 		}
 	})
 	return nil
+}
+
+func startSpan(ctx context.Context, name, routingKey string) (context.Context, trace.Span) {
+	return obs.Tracer("gateway").Start(ctx, name, trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("messaging.system", "rabbitmq"),
+			attribute.String("messaging.rabbitmq.destination.routing_key", routingKey)))
+}
+
+func recordError(span trace.Span, err error) {
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	}
 }

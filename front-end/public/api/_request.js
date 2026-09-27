@@ -1,8 +1,8 @@
 // front-end/public/api/_request.js
 
-// NOTE: in your browser, "orchestrator" isn't a DNS name.
-// Use localhost:8080 (or adjust if you run the orchestrator elsewhere).
-const API_BASE = 'http://localhost:8080';
+// The reverse proxy serves the gateway under /api on the same origin, so
+// cookies are first-party and no CORS is involved.
+const API_BASE = '/api';
 
 /**
  * Generic request helper that:

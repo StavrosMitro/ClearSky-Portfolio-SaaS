@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -10,7 +9,6 @@ import (
 
 	"orchestrator/internal/api"
 	"orchestrator/internal/middleware"
-	"orchestrator/internal/rpc"
 
 	"github.com/gin-gonic/gin"
 )
@@ -90,6 +88,24 @@ func HandleGoogleSignup(c *gin.Context, m Messenger) {
 	api.Success(c, http.StatusOK, gin.H{"role": response.Role, "user_id": response.UserID})
 }
 
+// HandleForgotPassword asks for a password-reset email. The reply is the same
+// whether or not an account exists, so it cannot reveal registered emails.
+func HandleForgotPassword(c *gin.Context, m Messenger) {
+	var req struct {
+		Email string `json:"email" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "Your email is required", nil)
+		return
+	}
+	var response map[string]any
+	if err := callJSON(c.Request.Context(), m, "auth.request", map[string]any{"type": "request_password_reset", "email": req.Email}, &response); err != nil {
+		accountError(c, err)
+		return
+	}
+	api.Success(c, http.StatusAccepted, response)
+}
+
 // HandleCreateInstructor lets the secretariat register an instructor, who
 // receives an email link to choose a password.
 func HandleCreateInstructor(c *gin.Context, m Messenger) {
@@ -155,29 +171,5 @@ func HandleStudentRosterUpload(c *gin.Context, m Messenger) {
 	api.Success(c, http.StatusOK, response)
 }
 
-// accountError returns user management's messages, which are written for end
-// users (e.g. which roster lines are invalid); other failures stay generic.
-func accountError(c *gin.Context, err error) {
-	var remote *rpc.RemoteError
-	if !errors.As(err, &remote) {
-		messagingError(c, err)
-		return
-	}
-	message := remote.RPCError.Message
-	switch remote.RPCError.Code {
-	case "INVALID_REQUEST":
-		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, message, nil)
-	case "UNAUTHENTICATED", "INVALID_CREDENTIALS":
-		api.Failure(c, http.StatusUnauthorized, api.CodeUnauthenticated, message, nil)
-	case "FORBIDDEN":
-		api.Failure(c, http.StatusForbidden, api.CodeForbidden, message, nil)
-	case "NOT_FOUND":
-		api.Failure(c, http.StatusNotFound, api.CodeNotFound, message, nil)
-	case "CONFLICT":
-		api.Failure(c, http.StatusConflict, api.CodeConflict, message, nil)
-	case "DEPENDENCY_UNAVAILABLE":
-		api.Failure(c, http.StatusServiceUnavailable, api.CodeServiceUnavailable, message, nil)
-	default:
-		messagingError(c, err)
-	}
-}
+// accountError is serviceError: identity's messages are written for users.
+func accountError(c *gin.Context, err error) { serviceError(c, err) }

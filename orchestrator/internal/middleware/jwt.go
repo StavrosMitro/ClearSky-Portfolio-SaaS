@@ -9,13 +9,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 type Claims struct {
-	UserID    string `json:"user_id"`
-	Username  string `json:"username,omitempty"`
-	Role      string `json:"role"`
-	StudentID string `json:"student_id,omitempty"` // Add student_id field
+	UserID        string `json:"user_id"`
+	InstitutionID string `json:"institution_id"`
+	Username      string `json:"username,omitempty"`
+	Role          string `json:"role"`
+	StudentID     string `json:"student_id,omitempty"` // Add student_id field
 	jwt.RegisteredClaims
 }
 
@@ -53,12 +55,13 @@ func JWTAuthMiddleware(jwtKey []byte, issuer, audience string) gin.HandlerFunc {
 			api.Abort(c, http.StatusUnauthorized, api.CodeUnauthenticated, "Invalid or expired token")
 			return
 		}
-		if claims.Subject == "" || claims.UserID != claims.Subject || claims.ID == "" || claims.IssuedAt == nil || !validRole(claims.Role) {
+		if claims.Subject == "" || claims.UserID != claims.Subject || claims.ID == "" || claims.IssuedAt == nil || !validRole(claims.Role) || !validUUID(claims.InstitutionID) {
 			api.Abort(c, http.StatusUnauthorized, api.CodeUnauthenticated, "Invalid token claims")
 			return
 		}
 
 		c.Set("user_id", claims.UserID)
+		c.Set("institution_id", claims.InstitutionID)
 		c.Set("username", claims.Username) // Add username to context
 		c.Set("role", claims.Role)
 		c.Set("student_id", claims.StudentID) // Set student_id in context
@@ -67,6 +70,11 @@ func JWTAuthMiddleware(jwtKey []byte, issuer, audience string) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func validUUID(value string) bool {
+	_, err := uuid.Parse(value)
+	return err == nil
 }
 
 func validRole(role string) bool {
@@ -83,6 +91,10 @@ const rawTokenKey = "raw_jwt"
 // Helper functions for other services to use
 func GetRawToken(c *gin.Context) string {
 	return c.GetString(rawTokenKey)
+}
+
+func GetInstitutionID(c *gin.Context) string {
+	return c.GetString("institution_id")
 }
 
 func GetUserID(c *gin.Context) string {

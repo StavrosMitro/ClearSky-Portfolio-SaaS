@@ -8,13 +8,14 @@ function renderStatsTable(stats, onSelect, selectedIdx = 0) {
   stats.forEach((row, idx) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td style="color:#006dd0;cursor:pointer;text-decoration:underline;">
-        ${row.classTitle || row.course_name || row.course || '-'}
-      </td>
-      <td>${row.declarationPeriod || row.exam_period || '-'}</td>
-      <td>${row.initialSubmissionDate?.split('T')[0] || '-'}</td>
-      <td>${row.finalSubmissionDate?.split('T')[0] || '-'}</td>
+      <td style="color:#006dd0;cursor:pointer;text-decoration:underline;"></td>
+      <td></td>
+      <td>${row.initial_published_at?.split('T')[0] || '-'}</td>
+      <td>${row.final_published_at?.split('T')[0] || '-'}</td>
     `;
+    // Course names come from uploaded workbooks: insert them as text.
+    tr.cells[0].textContent = `${row.course_title} (${row.course_code})`;
+    tr.cells[1].textContent = row.period;
     tr.style.cursor = 'pointer';
     if (idx === selectedIdx) {
       tr.style.background = '#e6e7ea';
@@ -111,19 +112,9 @@ window.addEventListener('DOMContentLoaded', async () => {
       selectedIdx = idx;
       renderStatsTable(stats, onSelect, selectedIdx);
 
-      const filters = {
-        course:            row.course_id        || row.course   || row.classTitle,
-        declarationPeriod: row.declarationPeriod || row.exam_period,
-        classTitle:        row.classTitle       || row.course_name || row.course
-      };
-
       try {
-        const data = await getDistributions(filters);
-        renderCharts(
-          data,
-          row.classTitle        || row.course_name || row.course || '-',
-          row.declarationPeriod || row.exam_period || ''
-        );
+        const { distributions } = await getDistributions(row.grading_id);
+        renderCharts(distributions, row.course_title, row.period);
       } catch (err) {
         flash('Failed to load statistics: ' + err.message);
       }

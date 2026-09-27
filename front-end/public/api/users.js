@@ -12,7 +12,19 @@ export const requestStudentRegistration = ({ student_id, email }) =>
   });
 
 /**
- * Finish an emailed link (student confirmation or instructor invitation) by
+ * Ask for a password-reset link. The reply is the same whether or not the
+ * account exists.
+ * @param {{ email: string }} payload
+ */
+export const requestPasswordReset = ({ email }) =>
+  request('/user/forgot-password', {
+    method: 'POST',
+    body  : { email }
+  });
+
+/**
+ * Finish an emailed link (student confirmation, instructor invitation or
+ * password reset) by
  * choosing a password.
  * @param {{ token: string, password: string }} payload
  */

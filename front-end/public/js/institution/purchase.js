@@ -1,47 +1,29 @@
-// public/js/institution/purchase.js
+// public/js/institution/purchase.js – buy credits for my institution (SRS 2.4)
 import { flash } from '../../script.js';
-import { purchaseCredits } from '../../api/credits.js';
-import { getInstitutions } from '../../api/institution.js';
+import { purchaseCredits, getMyCredits } from '../../api/credits.js';
 
-console.log('🛠️ purchase.js loaded');
+const balance = document.querySelector('#credit-balance');
 
-async function populateInstitutions() {
-  const select = document.querySelector('#inst-name');
+async function showBalance() {
   try {
-    const list = await getInstitutions();
-    // clear placeholder
-    select.innerHTML = '<option value="">– choose an institution –</option>';
-    list.forEach(inst => {
-      const opt = document.createElement('option');
-      opt.value = inst.name;
-      opt.textContent = inst.name;
-      select.appendChild(opt);
-    });
+    const inst = await getMyCredits();
+    balance.textContent = `${inst.name}: ${inst.credits} credits (1 credit = one course grading)`;
   } catch (err) {
-    console.error('⚠️ Error loading institutions:', err);
-    flash('Could not load institutions');
-    // leave the placeholder so user sees no options
+    balance.textContent = err.message; // e.g. the institution is not registered yet
   }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  populateInstitutions();
-
+  showBalance();
   const form = document.querySelector('#purchase-form');
   form.addEventListener('submit', async e => {
     e.preventDefault();
-    console.log('🛠️ submit event fired');
-
-    const instName = form.instName.value;
-    const amount   = Number(form.amount.value);
-    console.log('🛠️ form values:', { instName, amount });
-
     try {
-      const response = await purchaseCredits({ name: instName, amount });
-      console.log('🛠️ API response:', response);
-      flash(response.message || 'Purchased successfully!');
+      const result = await purchaseCredits({ amount: Number(form.amount.value) });
+      flash(`Purchased. Balance: ${result.credits} credits`);
+      form.reset();
+      showBalance();
     } catch (err) {
-      console.error('🛠️ purchaseCredits error:', err);
       flash(err.message || 'Purchase failed');
     }
   });

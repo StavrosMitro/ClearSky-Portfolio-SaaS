@@ -2,31 +2,62 @@
 package routes
 
 import (
+	"log/slog"
 	"net/http"
+	"strings"
+	"time"
+
 	"orchestrator/internal/api"
 	"orchestrator/internal/handlers"
 	mw "orchestrator/internal/middleware"
+	"orchestrator/internal/ratelimit"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+)
+
+// Options holds the router settings that are not part of JWT or CORS.
+type Options struct {
+	// AuthLimiter limits authentication endpoints per client; nil disables it.
+	AuthLimiter *ratelimit.Limiter
+	// ClientIP identifies the client (trusted proxies); nil uses the TCP peer.
+	ClientIP func(*http.Request) string
+}
+
+const (
+	roleStudent        = "student"
+	roleInstructor     = "instructor"
+	roleRepresentative = "institution_representative"
 )
 
 // SetupRouter configures all HTTP endpoints and returns the Gin engine.
-func SetupRouter(m handlers.Messenger, allowedOrigins []string, jwtKey []byte, jwtIssuer, jwtAudience string) *gin.Engine {
-	r := gin.Default()
+func SetupRouter(m handlers.Messenger, allowedOrigins []string, jwtKey []byte, jwtIssuer, jwtAudience string, opts Options) *gin.Engine {
+	r := gin.New()
+	// Gin never trusts forwarding headers; ClientIP below decides.
+	_ = r.SetTrustedProxies(nil)
+	clientIP := opts.ClientIP
+	if clientIP == nil {
+		clientIP = func(req *http.Request) string {
+			host, _, _ := splitHostPort(req.RemoteAddr)
+			return host
+		}
+	}
+	r.Use(gin.Recovery())
+	r.Use(otelgin.Middleware("gateway"))
 	r.Use(api.RequestIDMiddleware())
-
+	r.Use(requestLog(clientIP))
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length", "X-Request-ID"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "Idempotency-Key"},
+		ExposeHeaders:    []string{"Content-Length", "X-Request-ID", "Retry-After"},
 		AllowCredentials: true,
 	}))
 	r.Use(requestBodyLimit(20 << 20))
 	r.Use(securityHeaders())
+	r.MaxMultipartMemory = 16 << 20
 
-	r.MaxMultipartMemory = 16 << 20 // 16 MiB
 	r.GET("/health/live", func(c *gin.Context) { api.Success(c, http.StatusOK, gin.H{"status": "live"}) })
 	r.GET("/health/ready", func(c *gin.Context) {
 		if m == nil || !m.Ready() {
@@ -36,101 +67,92 @@ func SetupRouter(m handlers.Messenger, allowedOrigins []string, jwtKey []byte, j
 		api.Success(c, http.StatusOK, gin.H{"status": "ready"})
 	})
 
-	// ────────────────────────────────────────────────────────────────────────
-	//  Public endpoints (no JWT)
-	// ────────────────────────────────────────────────────────────────────────
-	{
-		r.POST("/user/register", func(c *gin.Context) { handlers.HandleStudentRegistration(c, m) })
-		r.POST("/user/activate", func(c *gin.Context) { handlers.HandleAccountActivation(c, m) })
-		r.POST("/user/google-signup", func(c *gin.Context) { handlers.HandleGoogleSignup(c, m) })
-		r.POST("/user/login", func(c *gin.Context) { handlers.HandleUserLogin(c, m) })
-		r.POST("/user/google-login", func(c *gin.Context) { handlers.HandleUserGoogleLogin(c, m) })
-		r.POST("/user/logout", handlers.HandleUserLogout)
-		r.GET("/institutions", func(c *gin.Context) {
-			handlers.GetInstitutions(c)
-		})
-		// NEW: purchase credits endpoint
-		// front-end does: PATCH /purchase { name, amount }
-
+	// ── Public endpoints (no JWT) ───────────────────────────────────────────
+	authLimit := func(c *gin.Context) { c.Next() }
+	if opts.AuthLimiter != nil {
+		authLimit = ratelimit.Middleware(opts.AuthLimiter, "auth", clientIP)
 	}
-	account := r.Group("/user")
-	account.Use(mw.JWTAuthMiddleware(jwtKey, jwtIssuer, jwtAudience))
-	account.PATCH("/change-password", func(c *gin.Context) { handlers.HandleUserChangePassword(c, m) })
+	with := func(h func(*gin.Context, handlers.Messenger)) gin.HandlerFunc {
+		return func(c *gin.Context) { h(c, m) }
+	}
+	r.POST("/user/register", authLimit, with(handlers.HandleStudentRegistration))
+	r.POST("/user/activate", authLimit, with(handlers.HandleAccountActivation))
+	r.POST("/user/google-signup", authLimit, with(handlers.HandleGoogleSignup))
+	r.POST("/user/login", authLimit, with(handlers.HandleUserLogin))
+	r.POST("/user/google-login", authLimit, with(handlers.HandleUserGoogleLogin))
+	r.POST("/user/forgot-password", authLimit, with(handlers.HandleForgotPassword))
+	r.POST("/user/logout", handlers.HandleUserLogout)
+	r.GET("/institutions", with(handlers.HandleListInstitutions))
+
+	authenticated := mw.JWTAuthMiddleware(jwtKey, jwtIssuer, jwtAudience)
+	only := func(roles ...string) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			for _, role := range roles {
+				if c.GetString("role") == role {
+					c.Next()
+					return
+				}
+			}
+			api.Abort(c, http.StatusForbidden, api.CodeForbidden, "Your role cannot use this endpoint")
+		}
+	}
+
+	// ── Every signed-in user ────────────────────────────────────────────────
+	account := r.Group("/user", authenticated)
+	account.PATCH("/change-password", with(handlers.HandleUserChangePassword))
 	account.GET("/me", func(c *gin.Context) {
-		api.Success(c, http.StatusOK, gin.H{"user_id": mw.GetUserID(c), "username": mw.GetUsername(c), "role": mw.GetRole(c), "student_id": mw.GetStudentID(c)})
+		api.Success(c, http.StatusOK, gin.H{"user_id": mw.GetUserID(c), "institution_id": mw.GetInstitutionID(c),
+			"username": mw.GetUsername(c), "role": mw.GetRole(c), "student_id": mw.GetStudentID(c)})
 	})
+	stats := r.Group("/stats", authenticated)
+	stats.GET("/available", with(handlers.HandleVisibleGradings))
+	stats.GET("/gradings/:id/distributions", with(handlers.HandleDistributions))
 
-	repr := r.Group("/")
-	repr.Use(mw.JWTAuthMiddleware(jwtKey, jwtIssuer, jwtAudience))
-	repr.Use(func(c *gin.Context) {
-		if c.GetString("role") != "institution_representative" {
-			api.Abort(c, http.StatusForbidden, api.CodeForbidden, "Access restricted to institution representatives only")
-			return
-		}
-		c.Next()
-	})
-	{
-		repr.PATCH("/purchase", func(c *gin.Context) {
-			handlers.HandleCreditsPurchased(c, m)
-		})
-		repr.GET("/mycredits", func(c *gin.Context) {
-			handlers.HandleCreditsAvail(c, m)
-		})
-		repr.POST("/registration", func(c *gin.Context) {
-			handlers.HandleInstitutionRegistered(c, m)
-		})
-		repr.POST("/institution/instructors", func(c *gin.Context) { handlers.HandleCreateInstructor(c, m) })
-		repr.POST("/institution/student-roster", func(c *gin.Context) { handlers.HandleStudentRosterUpload(c, m) })
-	}
-	// ────────────────────────────────────────────────────────────────────────
-	//  Student‐only endpoints
-	// ────────────────────────────────────────────────────────────────────────
-	std := r.Group("/")
-	std.Use(mw.JWTAuthMiddleware(jwtKey, jwtIssuer, jwtAudience))
-	std.Use(func(c *gin.Context) {
-		if c.GetString("role") != "student" {
-			api.Abort(c, http.StatusForbidden, api.CodeForbidden, "Access restricted to students only")
-			return
-		}
-		c.Next()
-	})
-	{
-		std.GET("/personal/grades", func(c *gin.Context) { handlers.HandleGetPersonalGrades(c, m) })
-		std.PATCH("/student/reviewRequest", func(c *gin.Context) { handlers.HandlePostNewRequest(c, m) })
-		std.PATCH("/student/status", func(c *gin.Context) { handlers.HandleGetRequestStatus(c, m) })
-	}
+	// ── Institution representatives (secretariat) ───────────────────────────
+	secretariat := r.Group("/", authenticated, only(roleRepresentative))
+	secretariat.POST("/registration", with(handlers.HandleRegisterInstitution))
+	secretariat.GET("/institution", with(handlers.HandleMyInstitution))
+	secretariat.GET("/mycredits", with(handlers.HandleMyInstitution))
+	secretariat.PATCH("/purchase", with(handlers.HandlePurchaseCredits))
+	secretariat.GET("/institution/credit-history", with(handlers.HandleCreditHistory))
+	secretariat.POST("/institution/instructors", with(handlers.HandleCreateInstructor))
+	secretariat.POST("/institution/student-roster", with(handlers.HandleStudentRosterUpload))
 
-	// ────────────────────────────────────────────────────────────────────────
-	//  Instructor‐only endpoints
-	// ────────────────────────────────────────────────────────────────────────
-	instr := r.Group("/")
-	instr.Use(mw.JWTAuthMiddleware(jwtKey, jwtIssuer, jwtAudience))
-	instr.Use(func(c *gin.Context) {
-		if c.GetString("role") != "instructor" {
-			api.Abort(c, http.StatusForbidden, api.CodeForbidden, "Access restricted to instructors only")
-			return
-		}
-		c.Next()
-	})
-	{
-		instr.POST("/upload_init", func(c *gin.Context) { handlers.UploadExcelInit(c, m) })
-		instr.PATCH("/postFinalGrades", func(c *gin.Context) { handlers.UploadExcelFinal(c, m) })
-		instr.PATCH("/instructor/review-list", func(c *gin.Context) { handlers.HandleGetRequestList(c, m) })
-		instr.PATCH("/instructor/reply", func(c *gin.Context) { handlers.HandlePostResponse(c, m) })
-	}
+	// ── Students ────────────────────────────────────────────────────────────
+	students := r.Group("/", authenticated, only(roleStudent), mw.RequireStudentID())
+	students.GET("/personal/grades", with(handlers.HandlePersonalGrades))
+	students.POST("/reviews", with(handlers.HandleCreateReview))
+	students.GET("/reviews/mine", with(handlers.HandleMyReviews))
 
-	// ────────────────────────────────────────────────────────────────────────
-	//  Shared stats endpoints (all roles)
-	// ────────────────────────────────────────────────────────────────────────
-	stats := r.Group("/stats")
-	stats.Use(mw.JWTAuthMiddleware(jwtKey, jwtIssuer, jwtAudience))
-	{
-		stats.GET("/available", func(c *gin.Context) { handlers.HandleSubmissionLogs(c, m) })
-		stats.GET("/courses", func(c *gin.Context) { handlers.HandleSubmissionLogs(c, m) })
-		stats.POST("/distributions", handlers.HandleGetDistributions(m))
-	}
+	// ── Instructors ─────────────────────────────────────────────────────────
+	instructors := r.Group("/", authenticated, only(roleInstructor))
+	instructors.POST("/grades/uploads", with(handlers.HandleGradesUpload))
+	instructors.POST("/grades/uploads/:id/confirm", with(handlers.HandleGradesConfirm))
+	instructors.POST("/grades/uploads/:id/cancel", with(handlers.HandleGradesCancel))
+	instructors.GET("/reviews/inbox", with(handlers.HandleReviewInbox))
+	instructors.GET("/reviews/:id", with(handlers.HandleReviewGet))
+	instructors.POST("/reviews/:id/reply", with(handlers.HandleReviewReply))
 
 	return r
+}
+
+// requestLog writes one JSON line per request (trace IDs are added by the
+// slog handler from the request context).
+func requestLog(clientIP func(*http.Request) string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		route := c.FullPath()
+		if strings.HasPrefix(route, "/health/") {
+			return // polled every few seconds by the container runtime
+		}
+		if route == "" {
+			route = "unmatched"
+		}
+		slog.InfoContext(c.Request.Context(), "http request",
+			"method", c.Request.Method, "route", route, "status", c.Writer.Status(),
+			"duration_ms", time.Since(start).Milliseconds(), "request_id", api.RequestID(c), "client_ip", clientIP(c.Request))
+	}
 }
 
 func requestBodyLimit(maxBytes int64) gin.HandlerFunc {

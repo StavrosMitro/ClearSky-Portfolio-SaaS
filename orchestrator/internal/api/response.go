@@ -17,6 +17,8 @@ const (
 	CodeForbidden           ErrorCode = "FORBIDDEN"
 	CodeNotFound            ErrorCode = "NOT_FOUND"
 	CodeConflict            ErrorCode = "CONFLICT"
+	CodeRateLimited         ErrorCode = "RATE_LIMITED"
+	CodeInsufficientCredits ErrorCode = "INSUFFICIENT_CREDITS"
 	CodeServiceUnavailable  ErrorCode = "SERVICE_UNAVAILABLE"
 	CodeServiceTimeout      ErrorCode = "SERVICE_TIMEOUT"
 	CodeInvalidServiceReply ErrorCode = "INVALID_SERVICE_RESPONSE"

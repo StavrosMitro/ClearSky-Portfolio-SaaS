@@ -1,0 +1,9 @@
+# Build context for services that build from the repository root.
+.git
+**/node_modules
+ai-log
+*.pdf
+*.vpp
+docs
+tests
+front-end

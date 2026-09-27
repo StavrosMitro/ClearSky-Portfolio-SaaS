@@ -6,55 +6,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	RabbitMQ struct {
-		URL string `yaml:"url"`
-	} `yaml:"rabbitmq"`
-	Exchange struct {
-		Name string `yaml:"name"`
-		Type string `yaml:"type"`
-	} `yaml:"exchange"`
-	Queue struct {
-		Name string `yaml:"name"`
-		DLX  string `yaml:"dlx"`
-	} `yaml:"queue"`
-	Bindings []string `yaml:"bindings"`
-}
-
-var Cfg Config
-
-func LoadConfig(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read config %q: %w", path, err)
+// AMQPURL is the broker address (required).
+func AMQPURL() (string, error) {
+	url := strings.TrimSpace(os.Getenv("AMQP_URL"))
+	if url == "" {
+		return "", fmt.Errorf("AMQP_URL must be set")
 	}
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return fmt.Errorf("parse config %q: %w", path, err)
-	}
-	if cfg.RabbitMQ.URL == "" || cfg.Exchange.Name == "" || cfg.Exchange.Type == "" || cfg.Queue.Name == "" {
-		return fmt.Errorf("config %q is missing required RabbitMQ, exchange, or queue values", path)
-	}
-	Cfg = cfg
-	return nil
-}
-
-func LoadFromEnvironment() error {
-	cfgPath := os.Getenv("CONFIG_PATH")
-	if cfgPath == "" {
-		cfgPath = "configs/config.dev.yaml"
-	}
-	if err := LoadConfig(cfgPath); err != nil {
-		return err
-	}
-	if url := os.Getenv("AMQP_URL"); url != "" {
-		Cfg.RabbitMQ.URL = url
-	}
-	return nil
+	return url, nil
 }
 
 func JWTSecret() ([]byte, error) {
@@ -120,6 +80,44 @@ func RabbitMQRequestTimeout() (time.Duration, error) {
 	value, err := time.ParseDuration(raw)
 	if err != nil || value < 100*time.Millisecond || value > 2*time.Minute {
 		return 0, fmt.Errorf("RABBITMQ_REQUEST_TIMEOUT must be a duration from 100ms to 2m")
+	}
+	return value, nil
+}
+
+// AuthRateLimit returns the per-client limit for authentication endpoints.
+// Defaults are generous because a campus network puts many students behind
+// few public addresses; per-account backoff in user management is the main
+// protection against password guessing.
+func AuthRateLimit() (perMinute, burst int, err error) {
+	perMinute, err = positiveInt("AUTH_RATE_LIMIT_PER_MINUTE", 60)
+	if err != nil {
+		return 0, 0, err
+	}
+	burst, err = positiveInt("AUTH_RATE_LIMIT_BURST", 20)
+	return perMinute, burst, err
+}
+
+// TrustedProxies lists the proxies whose X-Forwarded-For is believed: IPs,
+// CIDRs or hostnames (resolved periodically). Empty means none: the client
+// address is the TCP peer.
+func TrustedProxies() []string {
+	var proxies []string
+	for _, value := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			proxies = append(proxies, value)
+		}
+	}
+	return proxies
+}
+
+func positiveInt(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > 100000 {
+		return 0, fmt.Errorf("%s must be an integer from 1 to 100000", name)
 	}
 	return value, nil
 }

@@ -1,0 +1,37 @@
+# ClearSky entry point (roadmap 2.6).
+# SITE_ADDRESS=localhost → HTTPS with Caddy's local CA (trust it once, see
+# README); a public domain gets a certificate automatically; "http://…"
+# serves plain HTTP (then set COOKIE_SECURE=false).
+{
+	admin off
+}
+
+{$SITE_ADDRESS:localhost} {
+	encode zstd gzip
+
+	# The gateway; /api is stripped. Caddy sets X-Forwarded-For, which the
+	# gateway trusts only from this proxy (TRUSTED_PROXIES=proxy).
+	handle_path /api/* {
+		reverse_proxy orchestrator:8080
+	}
+
+	# Google OAuth redirect and callback are served by identity.
+	handle /auth/google/* {
+		reverse_proxy identity:8080
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	log {
+		output stdout
+		format json
+	}
+}

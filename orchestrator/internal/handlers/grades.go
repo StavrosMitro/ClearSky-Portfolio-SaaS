@@ -1,29 +1,45 @@
 package handlers
 
 import (
-	"bytes"
+	"context"
 	"encoding/base64"
-	"github.com/gin-gonic/gin"
-	"github.com/xuri/excelize/v2"
 	"io"
+	"log/slog"
 	"net/http"
-	"orchestrator/internal/api"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"orchestrator/internal/api"
+	mw "orchestrator/internal/middleware"
+
+	"clearsky/contracts/messages"
+	"clearsky/contracts/topology"
+
+	"github.com/gin-gonic/gin"
 )
 
-type ExcelUploadResponse struct {
-	Message string `json:"message"`
+const maxWorkbookBytes = 5 << 20
+
+func uploaderFields(c *gin.Context, msgType string) map[string]any {
+	return map[string]any{"type": msgType, "institution_id": mw.GetInstitutionID(c), "uploader_id": mw.GetUserID(c)}
 }
 
-func upload(c *gin.Context, m Messenger, key string, final bool, after func([]byte, string) error) {
-	file, err := c.FormFile("file")
-	if err != nil {
-		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "An Excel file is required", nil)
+// HandleGradesUpload parses an initial or final workbook and returns the
+// preview to CONFIRM or CANCEL (SRS 2.5, 2.10).
+func HandleGradesUpload(c *gin.Context, m Messenger) {
+	kind := c.PostForm("kind")
+	if kind != "initial" && kind != "final" {
+		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "Choose whether these are initial or final grades", nil)
 		return
 	}
-	if !strings.EqualFold(filepath.Ext(file.Filename), ".xlsx") {
-		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "Only .xlsx files are allowed", nil)
+	file, err := c.FormFile("file")
+	if err != nil {
+		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "An .xlsx workbook is required", nil)
+		return
+	}
+	if !strings.EqualFold(filepath.Ext(file.Filename), ".xlsx") || file.Size > maxWorkbookBytes {
+		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "Upload an .xlsx workbook smaller than 5 MiB", nil)
 		return
 	}
 	src, err := file.Open()
@@ -32,61 +48,106 @@ func upload(c *gin.Context, m Messenger, key string, final bool, after func([]by
 		return
 	}
 	defer src.Close()
-	data, err := io.ReadAll(src)
-	if err != nil {
-		api.Internal(c)
+	data, err := io.ReadAll(io.LimitReader(src, maxWorkbookBytes+1))
+	if err != nil || len(data) > maxWorkbookBytes {
+		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "Upload an .xlsx workbook smaller than 5 MiB", nil)
 		return
 	}
-	workbook, err := excelize.OpenReader(bytes.NewReader(data))
-	if err != nil {
-		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "The uploaded file is not a valid Excel workbook", nil)
+	req := uploaderFields(c, "preview")
+	req["kind"], req["filename"], req["file_base64"] = kind, filepath.Base(file.Filename), base64.StdEncoding.EncodeToString(data)
+	var preview map[string]any
+	if err := callJSON(c.Request.Context(), m, topology.KeyGradesIngest, req, &preview); err != nil {
+		serviceError(c, err)
 		return
 	}
-	if err := workbook.Close(); err != nil {
-		api.Internal(c)
+	api.Success(c, http.StatusOK, preview)
+}
+
+// HandleGradesConfirm publishes an upload. It is an orchestrated saga:
+//  1. ask grades-ingest whether this creates a new grading;
+//  2. if so, charge one credit (idempotent per grading, so retries and
+//     duplicate uploads never charge twice);
+//  3. commit in grades-ingest (state machine NULL → open → final);
+//  4. forward the snapshot to grades-query and the header to reviews.
+//
+// A lost step-4 message is repaired by the receivers' reconcile.
+func HandleGradesConfirm(c *gin.Context, m Messenger) {
+	ctx := c.Request.Context()
+	uploadID := c.Param("id")
+	statusReq := uploaderFields(c, "upload_status")
+	statusReq["upload_id"] = uploadID
+	var status struct {
+		GradingID      string `json:"grading_id"`
+		CanConfirm     bool   `json:"can_confirm"`
+		RequiresCredit bool   `json:"requires_credit"`
+	}
+	if err := callJSON(ctx, m, topology.KeyGradesIngest, statusReq, &status); err != nil {
+		serviceError(c, err)
 		return
 	}
-	var response ExcelUploadResponse
-	reply, err := m.Call(c.Request.Context(), key, []byte(base64.StdEncoding.EncodeToString(data)))
-	if err != nil {
-		messagingError(c, err)
-		return
-	}
-	if err := decodeRPCReply(reply, &response); err != nil {
-		messagingError(c, err)
-		return
-	}
-	if after != nil {
-		if err := after(data, file.Filename); err != nil {
-			messagingError(c, err)
+	charged := false
+	if status.CanConfirm && status.RequiresCredit {
+		var balance struct {
+			Applied bool `json:"applied"`
+		}
+		if err := callJSON(ctx, m, topology.KeyInstitutions, map[string]any{
+			"type": "charge", "institution_id": mw.GetInstitutionID(c), "grading_id": status.GradingID,
+			"actor_user_id": mw.GetUserID(c),
+		}, &balance); err != nil {
+			serviceError(c, err)
 			return
 		}
+		charged = balance.Applied
 	}
-	if final {
-		api.Success(c, http.StatusOK, gin.H{
-			"message": "final grades uploaded and credits deducted",
-			"details": response,
-		})
+	confirmReq := uploaderFields(c, "confirm")
+	confirmReq["upload_id"] = uploadID
+	var snapshot messages.GradingSnapshot
+	if err := callJSON(ctx, m, topology.KeyGradesIngest, confirmReq, &snapshot); err != nil {
+		serviceError(c, err)
 		return
 	}
-	api.Success(c, http.StatusOK, response)
-}
-func UploadExcelInit(c *gin.Context, m Messenger) {
-	upload(c, m, "postgrades.init", false, func(data []byte, name string) error {
-		if err := ForwardToStatistics(c.Request.Context(), m, data, name); err != nil {
-			return err
-		}
-		return ForwardToView(c.Request.Context(), m, data, name)
+	synced := forwardGrading(ctx, m, snapshot)
+	api.Success(c, http.StatusOK, gin.H{
+		"grading_id": snapshot.GradingID, "course_code": snapshot.CourseCode, "course_title": snapshot.CourseTitle,
+		"period": snapshot.Period, "state": snapshot.State, "version": snapshot.Version,
+		"student_count": len(snapshot.Grades), "charged": charged, "synchronised": synced,
 	})
 }
-func UploadExcelFinal(c *gin.Context, m Messenger) {
-	upload(c, m, "postgrades.final", true, func(data []byte, name string) error {
-		if err := HandleCreditsSpent(c.Request.Context(), m); err != nil {
-			return err
-		}
-		if err := ForwardToStatistics(c.Request.Context(), m, data, name); err != nil {
-			return err
-		}
-		return ForwardToView(c.Request.Context(), m, data, name)
-	})
+
+// forwardGrading sends the grading to its readers. Student names stay in
+// grades-ingest; reviews gets only the header. Failures are logged: the
+// receivers reconcile with grades-ingest periodically.
+func forwardGrading(parent context.Context, m Messenger, snapshot messages.GradingSnapshot) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
+	defer cancel()
+	forQuery := snapshot
+	forQuery.Type = messages.TypeGradingSnapshot
+	forQuery.Grades = make([]messages.StudentGrade, len(snapshot.Grades))
+	for i, g := range snapshot.Grades {
+		g.StudentName = ""
+		forQuery.Grades[i] = g
+	}
+	ok := true
+	if err := publishJSON(ctx, m, topology.KeyGradesSync, forQuery); err != nil {
+		slog.WarnContext(ctx, "forward grading to grades-query failed; reconcile will repair it", "grading_id", snapshot.GradingID, "error", err)
+		ok = false
+	}
+	header := messages.HeaderMessage{Type: messages.TypeGradingHeader, GradingHeader: snapshot.GradingHeader}
+	if err := publishJSON(ctx, m, topology.KeyReviewsSync, header); err != nil {
+		slog.WarnContext(ctx, "forward grading to reviews failed; reconcile will repair it", "grading_id", snapshot.GradingID, "error", err)
+		ok = false
+	}
+	return ok
+}
+
+// HandleGradesCancel discards a preview.
+func HandleGradesCancel(c *gin.Context, m Messenger) {
+	req := uploaderFields(c, "cancel")
+	req["upload_id"] = c.Param("id")
+	var result map[string]any
+	if err := callJSON(c.Request.Context(), m, topology.KeyGradesIngest, req, &result); err != nil {
+		serviceError(c, err)
+		return
+	}
+	api.Success(c, http.StatusOK, result)
 }

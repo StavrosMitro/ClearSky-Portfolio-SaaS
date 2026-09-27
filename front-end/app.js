@@ -22,10 +22,6 @@ const API_BASE        =
   process.env.ORCHESTRATOR_URL ||
   'http://orchestrator:8080';
 
-const GOOGLE_AUTH_URL =
-  process.env.GOOGLE_AUTH_URL ||
-  'http://google_auth_service:8086';    // Use Docker service name
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 1)  3rd-party middleware
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,15 +66,9 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6)  GOOGLE OAUTH PROXY
-//    Forward front-end `/auth/google/...` to your google_auth_service.
+// 6)  GOOGLE SIGN-IN
+//    The proxy sends `/auth/google/...` to identity, which redirects back here.
 // ─────────────────────────────────────────────────────────────────────────────
-app.get('/auth/google/login', (req, res) => {
-  // For Docker, we need to redirect to the external URL
-  const externalGoogleAuthUrl = process.env.GOOGLE_AUTH_EXTERNAL_URL || 'http://localhost:8086';
-  res.redirect(`${externalGoogleAuthUrl}/auth/google/login`);
-});
-
 async function authenticatedUser(req) {
   const token = req.cookies.jwt;
   if (!token) return null;
@@ -90,10 +80,11 @@ async function authenticatedUser(req) {
   return payload.data || null;
 }
 
-// Handle successful Google login callback
-app.get('/auth/google/callback', async (req, res) => {
+// Identity (behind the proxy at /auth/google/*) redirects here after Google
+// sign-in has set the session cookie.
+app.get('/login/google/success', async (req, res) => {
   try {
-    const user = req.query.google_login === 'success' ? await authenticatedUser(req) : null;
+    const user = await authenticatedUser(req);
     if (!user) return res.redirect('/login?error=google_login_failed');
     req.session.user = { username: user.username, role: user.role };
 
@@ -164,7 +155,8 @@ const LOGIN_ERRORS = {
   google_domain          : 'Sign in with your university Google account.',
   google_not_registered  : 'This Google account is not registered. Students must be in the secretariat\'s registry; instructors are registered by the secretariat.',
   google_account_conflict: 'An account already exists for this student ID. Sign in with your password.',
-  google_login_failed    : 'Google sign-in failed. Please try again.'
+  google_login_failed    : 'Google sign-in failed. Please try again.',
+  google_unavailable     : 'Google sign-in is not available here. Sign in with your password.'
 };
 
 app.get('/login', (req, res) =>
@@ -174,6 +166,10 @@ app.get('/login', (req, res) =>
     notice: req.query.activated === '1' ? 'Your password is set. You can now log in.' : null,
     user  : null
   })
+);
+
+app.get('/forgot-password', (_, res) =>
+  res.render('forgotPassword', { title: 'Reset your password', user: null })
 );
 
 // Emailed links: the token stays in the URL fragment and is read client-side.
@@ -259,19 +255,14 @@ app.get('/instructor/post-initial', auth('instructor'), (req,res)=>res.render('i
 app.get('/instructor/post-final',   auth('instructor'), (req,res)=>res.render('instructor/postFinal',  { user:req.session.user, title:'Post Final' }));
 app.get('/instructor/review-list',  auth('instructor'), (req,res)=>res.render('instructor/reviewList', { user:req.session.user, title:'Review Requests' }));
 app.get('/instructor/reply',        auth('instructor'), (req,res)=>{
-  // Extract query parameters from URL
-  const course_id   = req.query.course   || '';
-  const exam_period = req.query.period   || '';
-  const user_id     = req.query.student  || '';
-  // Optionally, you could look up course_name/student_name from DB if needed
-
+  // The details are loaded by reply.js from the request ID in the URL.
   res.render('instructor/replyForm',{
     user        : req.session.user,
     title       : 'Reply to Review Request',
-    request_id  : '', // not used, but kept for compatibility
-    course_name : course_id,
-    exam_period : exam_period,
-    student_name: user_id,
+    request_id  : '',
+    course_name : '',
+    exam_period : '',
+    student_name: '',
   });
 });
 app.get('/instructor/statistics',   auth('instructor'), (req,res)=>res.render('instructor/statistics', { user:req.session.user, title:'Statistics' }));
@@ -282,6 +273,8 @@ app.get('/institution/register',        auth('institution'), (req,res)=>res.rend
 app.get('/institution/purchase',        auth('institution'), (req,res)=>res.render('institution/purchase',       { user:req.session.user, title:'Purchase' }));
 app.get('/institution/user-management', auth('institution'), (req,res)=>res.render('institution/userManagement', { user:req.session.user, title:'Users' }));
 app.get('/institution/statistics',      auth('institution'), (req,res)=>res.render('institution/statistics',     { user:req.session.user, title:'Statistics' }));
+
+app.get('/health/live', (_, res) => res.json({ status: 'live' }));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 10) Server start-up

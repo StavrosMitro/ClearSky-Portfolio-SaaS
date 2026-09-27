@@ -1,54 +1,44 @@
-// front-end/public/js/student/my-courses.js
+// front-end/public/js/student/my-courses.js – the student's gradings (SRS 2.7)
 import { flash } from '../../script.js';
-import { getStudentCourses } from '../../api/personal.js';
+import { getMyGrades } from '../../api/personal.js';
+
+const link = (href, label, enabled = true) => {
+  const a = document.createElement('a');
+  a.textContent = label;
+  a.className = enabled ? 'button' : 'button button--secondary';
+  if (enabled) a.href = href;
+  else Object.assign(a.style, { pointerEvents: 'none', opacity: '0.6' });
+  return a;
+};
 
 window.addEventListener('DOMContentLoaded', async () => {
+  const tbody = document.querySelector('table tbody');
   try {
-    const courses = await getStudentCourses();      // array from /personal/grades
-    const tbody   = document.querySelector('table tbody');
-
-    if (!courses.length) {
-      tbody.innerHTML = `
-        <tr><td colspan="4" style="text-align:center;">No courses found.</td></tr>
-      `;
+    const grades = await getMyGrades();
+    if (!grades.length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">No courses found.</td></tr>';
       return;
     }
-
-    tbody.innerHTML = courses.map(c => {
-      // accept camelCase or snake_case
-      const courseName  = c.classTitle        ?? c.course_name  ?? '—';
-      const examPeriod  = c.declarationPeriod ?? c.exam_period  ?? '—';
-
-      // status might be a string ("open"/"closed") or numeric (0/1)
-      let status = c.status ?? c.grading_status;
-      if (typeof status === 'number') status = status === 0 ? 'open' : 'closed';
-      if (!status) status = '—';
-
-      // course id for link building – fall back to courseName when missing
-      const courseId = c.course_id ?? c.id ?? encodeURIComponent(courseName);
-
-      // Disable Ask review if status is closed
-      const askReviewBtn = status === 'open'
-        ? `<a href="/student/request?course=${courseId}&period=${encodeURIComponent(examPeriod)}"
-               class="button">Ask review</a>`
-        : `<a class="button button--secondary" style="pointer-events:none;opacity:0.6;cursor:not-allowed;">Ask review</a>`;
-
-      return `
-        <tr ${status === 'open' ? 'style="background:#e6e7ea;"' : ''}>
-          <td>${courseName}</td>
-          <td>${examPeriod}</td>
-          <td>${status}</td>
-          <td>
-            <a href="/student/personal?course=${courseId}&period=${encodeURIComponent(examPeriod)}"
-               class="button">View grades</a>
-
-            ${askReviewBtn}
-
-            <a href="/student/status?course=${courseId}&period=${encodeURIComponent(examPeriod)}"
-               class="button${status === 'open' ? ' button--secondary' : ''}">Status</a>
-          </td>
-        </tr>`;
-    }).join('');
+    tbody.innerHTML = '';
+    for (const g of grades) {
+      const open = g.state === 'open';
+      const id = encodeURIComponent(g.grading_id);
+      const tr = document.createElement('tr');
+      if (open) tr.style.background = '#e6e7ea';
+      for (const text of [`${g.course_title} (${g.course_code})`, g.period, g.state]) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      const actions = document.createElement('td');
+      actions.append(
+        link(`/student/personal?grading=${id}`, 'View grades'), ' ',
+        link(`/student/request?grading=${id}`, 'Ask review', open), ' ',
+        link(`/student/status?grading=${id}`, 'Status'),
+      );
+      tr.appendChild(actions);
+      tbody.appendChild(tr);
+    }
   } catch (err) {
     flash(err.message || 'Failed to load courses');
   }

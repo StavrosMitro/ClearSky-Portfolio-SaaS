@@ -1,38 +1,35 @@
-// front-end/public/js/student/review-status.js
+// front-end/public/js/student/review-status.js – a review request's status
 import { flash } from '../../script.js';
-import { getReviewStatus } from '../../api/student.js';
+import { getMyReviews } from '../../api/student.js';
+
+const ACTIONS = { total_accept: 'Total accept', partial_accept: 'Partial accept', reject: 'Reject' };
+const when = value => (value ? new Date(value).toLocaleString() : '');
 
 window.addEventListener('DOMContentLoaded', async () => {
-  const params      = new URLSearchParams(location.search);
-  const course_id   = params.get('course');
-  const exam_period = params.get('period');   // optional
-
-  if (!course_id) {
-    flash('Please pick a course first');
-    window.location.href = '/student/my-courses';
+  const gradingId = new URLSearchParams(location.search).get('grading');
+  if (!gradingId) {
+    location.href = '/student/my-courses';
     return;
   }
-
   try {
-    const data = await getReviewStatus({ course_id, exam_period });
-    // If backend returns a message (no review found), show it
-    if (data && data.message) {
-      flash(data.message);
+    const review = (await getMyReviews()).find(r => r.grading_id === gradingId);
+    if (!review) {
+      flash('You have not asked for a review of this course.');
       return;
     }
-    // Fill all fields in the panel
-    document.getElementById('course_id').value = data.course_id ?? '';
-    document.getElementById('exam_period').value = data.exam_period ?? '';
-    document.getElementById('student_message').value = data.student_message ?? '';
-    document.getElementById('status').value = data.status ?? '';
-    document.getElementById('instructor_action').value = data.instructor_action ?? '';
-    document.getElementById('instructor_reply_message').value = data.instructor_reply_message ?? '';
-    document.getElementById('review_created_at').value = data.review_created_at
-      ? new Date(data.review_created_at).toLocaleString()
-      : '';
-    document.getElementById('reviewed_at').value = data.reviewed_at
-      ? new Date(data.reviewed_at).toLocaleString()
-      : '';
+    const fields = {
+      course_id: `${review.course_title} (${review.course_code})`,
+      exam_period: review.period,
+      student_message: review.message,
+      status: review.status,
+      instructor_action: ACTIONS[review.reply_action] ?? '',
+      instructor_reply_message: review.reply_message ?? '',
+      review_created_at: when(review.created_at),
+      reviewed_at: when(review.replied_at),
+    };
+    for (const [id, value] of Object.entries(fields)) {
+      document.getElementById(id).value = value;
+    }
   } catch (err) {
     flash(err.message);
   }

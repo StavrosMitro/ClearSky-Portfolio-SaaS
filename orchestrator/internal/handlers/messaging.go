@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"clearsky/contracts/rpc"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,7 +9,6 @@ import (
 	"net/http"
 	"orchestrator/internal/api"
 	"orchestrator/internal/messaging"
-	"orchestrator/internal/rpc"
 
 	"github.com/gin-gonic/gin"
 )
@@ -86,5 +86,35 @@ func writeRPCError(c *gin.Context, rpcErr rpc.Error) {
 			return
 		}
 		api.Failure(c, http.StatusBadGateway, api.CodeInvalidServiceReply, "A required service rejected the operation", nil)
+	}
+}
+
+// serviceError maps an error from a service that writes user-facing
+// messages (identity, institutions, grades, reviews): the message of a
+// client error is shown as is; anything else stays generic.
+func serviceError(c *gin.Context, err error) {
+	var remote *rpc.RemoteError
+	if !errors.As(err, &remote) {
+		messagingError(c, err)
+		return
+	}
+	message := remote.RPCError.Message
+	switch remote.RPCError.Code {
+	case rpc.CodeInvalidRequest:
+		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, message, nil)
+	case rpc.CodeUnauthenticated, rpc.CodeInvalidCredentials:
+		api.Failure(c, http.StatusUnauthorized, api.CodeUnauthenticated, message, nil)
+	case rpc.CodeForbidden:
+		api.Failure(c, http.StatusForbidden, api.CodeForbidden, message, nil)
+	case rpc.CodeNotFound:
+		api.Failure(c, http.StatusNotFound, api.CodeNotFound, message, nil)
+	case rpc.CodeConflict:
+		api.Failure(c, http.StatusConflict, api.CodeConflict, message, nil)
+	case rpc.CodeInsufficientCredits:
+		api.Failure(c, http.StatusConflict, api.CodeInsufficientCredits, message, nil)
+	case rpc.CodeDependencyUnavailable:
+		api.Failure(c, http.StatusServiceUnavailable, api.CodeServiceUnavailable, message, nil)
+	default:
+		messagingError(c, err)
 	}
 }

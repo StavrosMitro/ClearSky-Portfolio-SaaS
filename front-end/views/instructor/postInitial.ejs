@@ -11,7 +11,7 @@
 
     <fieldset><legend>INITIAL GRADES POSTING</legend>
       <!-- No action/method → handled by JS -->
-      <form id="upload-init-form" enctype="multipart/form-data">
+      <form id="upload-form" enctype="multipart/form-data">
         <div class="form-group">
           <label for="xlsx-init">XLSX file with initial grades</label>
           <input id="xlsx-init" type="file" name="file"
@@ -22,11 +22,12 @@
     </fieldset>
 
     <fieldset><legend>XLSX file parsing (preview)</legend>
-      <div class="form-group"><label>Course:</label><input readonly value="" /></div>
-      <div class="form-group"><label>Period:</label><input readonly value="" /></div>
-      <div class="form-group"><label>Number of grades:</label><input readonly value="" style="width:120px"/></div>
-      <button class="button">CONFIRM</button>
-      <button class="button button--secondary">CANCEL</button>
+      <div class="form-group"><label for="preview-course">Course:</label><input id="preview-course" readonly value="" /></div>
+      <div class="form-group"><label for="preview-period">Period:</label><input id="preview-period" readonly value="" /></div>
+      <div class="form-group"><label for="preview-count">Number of grades:</label><input id="preview-count" readonly value="" /></div>
+      <ul id="preview-problems" style="color:#c00;"></ul>
+      <button id="preview-confirm" class="button" type="button">CONFIRM</button>
+      <button id="preview-cancel" class="button button--secondary" type="button">CANCEL</button>
     </fieldset>
 
     <%- include('../partials/messageBox') %>

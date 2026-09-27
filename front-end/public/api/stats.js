@@ -1,21 +1,9 @@
 // public/api/stats.js
 import { request } from './_request.js';
 
-/**
- * GET /stats/available
- * returns either { data: […] } or […] directly
- */
-export async function getAvailableStats() {
-  return request('/stats/available');
-}
+/** Gradings the signed-in user may see (SRS 2.6). */
+export const getAvailableStats = () => request('/stats/available');
 
-/**
- * POST /stats/distributions
- * again, unwrap .data if present
- */
-export async function getDistributions({ course, declarationPeriod, classTitle }) {
-  return request('/stats/distributions', {
-    method: 'POST',
-    body: { course, declarationPeriod, classTitle }
-  });
-}
+/** Precomputed charts of one grading: { grading, distributions: { grade, Q1, … } }. */
+export const getDistributions = gradingId =>
+  request(`/stats/gradings/${encodeURIComponent(gradingId)}/distributions`);

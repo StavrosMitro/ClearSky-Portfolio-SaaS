@@ -10,15 +10,29 @@ import (
 	"syscall"
 	"time"
 
+	"clearsky/contracts/obs"
+	"clearsky/contracts/topology"
+	"orchestrator/internal/clientip"
 	"orchestrator/internal/config"
 	"orchestrator/internal/rabbitmq"
+	"orchestrator/internal/ratelimit"
 	"orchestrator/internal/routes"
 )
 
 func main() {
-	log.Println("Starting Orchestrator...")
-	if err := config.LoadFromEnvironment(); err != nil {
-		log.Fatalf("Load configuration: %v", err)
+	shutdownTracing, err := obs.Setup(context.Background(), "gateway")
+	if err != nil {
+		log.Fatalf("Observability: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(ctx)
+	}()
+	log.Println("Starting gateway (orchestrator)...")
+	amqpURL, err := config.AMQPURL()
+	if err != nil {
+		log.Fatalf("RabbitMQ configuration: %v", err)
 	}
 	jwtKey, err := config.JWTSecret()
 	if err != nil {
@@ -41,24 +55,30 @@ func main() {
 	if err != nil {
 		log.Fatalf("RabbitMQ configuration: %v", err)
 	}
-	client, err := rabbitmq.New(config.Cfg.RabbitMQ.URL, maxInFlight, requestTimeout)
+	client, err := rabbitmq.New(amqpURL, maxInFlight, requestTimeout)
 	if err != nil {
 		log.Fatalf("RabbitMQ connection failed: %v", err)
 	}
 	defer client.Close()
 
-	if err := rabbitmq.SetupMessaging(client.TopologyChannel()); err != nil {
-		log.Printf("SetupMessaging failed: %v", err)
-		return
-	}
-	if err := rabbitmq.StartOrchestratorConsumer(client.EventChannel()); err != nil {
-		log.Printf("Consumer failed: %v", err)
-		return
+	// The services declare their own queues; the gateway only needs the
+	// exchanges it publishes to.
+	if err := topology.DeclareExchanges(client.TopologyChannel()); err != nil {
+		log.Fatalf("Declare exchanges: %v", err)
 	}
 
-	log.Printf("Orchestrator listening on exchange '%s', queue '%s'...", config.Cfg.Exchange.Name, config.Cfg.Queue.Name)
-
-	router := routes.SetupRouter(client, allowedOrigins, jwtKey, jwtIssuer, jwtAudience)
+	authPerMinute, authBurst, err := config.AuthRateLimit()
+	if err != nil {
+		log.Fatalf("Rate limit configuration: %v", err)
+	}
+	proxies := clientip.New(config.TrustedProxies())
+	refreshCtx, stopRefresh := context.WithCancel(context.Background())
+	defer stopRefresh()
+	go proxies.Run(refreshCtx, 30*time.Second)
+	router := routes.SetupRouter(client, allowedOrigins, jwtKey, jwtIssuer, jwtAudience, routes.Options{
+		AuthLimiter: ratelimit.New(authPerMinute, authBurst),
+		ClientIP:    proxies.ClientIP,
+	})
 
 	server := &http.Server{
 		Addr:              ":8080",

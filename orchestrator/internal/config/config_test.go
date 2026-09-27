@@ -1,8 +1,6 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -41,19 +39,14 @@ func TestRabbitMQRequestTimeoutRejectsUnsafeValues(t *testing.T) {
 	}
 }
 
-func TestLoadFromEnvironmentOverridesYAMLRabbitMQURL(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	config := []byte("rabbitmq:\n  url: amqp://from-file\nexchange:\n  name: events\n  type: topic\nqueue:\n  name: orchestrator\n")
-	if err := os.WriteFile(path, config, 0o600); err != nil {
-		t.Fatal(err)
+func TestAMQPURLIsRequired(t *testing.T) {
+	t.Setenv("AMQP_URL", "")
+	if _, err := AMQPURL(); err == nil {
+		t.Fatal("accepted an empty AMQP_URL")
 	}
-	t.Setenv("CONFIG_PATH", path)
 	t.Setenv("AMQP_URL", "amqp://from-environment")
-	if err := LoadFromEnvironment(); err != nil {
-		t.Fatal(err)
-	}
-	if Cfg.RabbitMQ.URL != "amqp://from-environment" {
-		t.Fatalf("RabbitMQ URL=%q", Cfg.RabbitMQ.URL)
+	if got, err := AMQPURL(); err != nil || got != "amqp://from-environment" {
+		t.Fatalf("AMQPURL() = %q, %v", got, err)
 	}
 }
 

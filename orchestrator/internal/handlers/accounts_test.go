@@ -166,3 +166,19 @@ func TestStudentRosterUploadRejectsWrongTypeOrSize(t *testing.T) {
 		})
 	}
 }
+
+func TestForgotPasswordForwardsOnlyTheEmail(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := &fakeMessenger{replies: [][]byte{[]byte(`{"version":1,"data":{"message":"If an account exists for this email, we sent a link to choose a new password."}}`)}}
+	c, w := newJSONContext(http.MethodPost, `{"email":"alice@uni.example","role":"institution_representative"}`)
+
+	HandleForgotPassword(c, m)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	body := decodeCall(t, m)
+	if len(body) != 2 || body["type"] != "request_password_reset" || body["email"] != "alice@uni.example" {
+		t.Fatalf("forwarded body = %v", body)
+	}
+}

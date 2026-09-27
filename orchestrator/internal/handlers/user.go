@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"log"
 	"net/http"
 	"orchestrator/internal/middleware"
 	"os"
@@ -10,13 +9,14 @@ import (
 	"orchestrator/internal/api"
 
 	"github.com/gin-gonic/gin"
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type authResult struct {
-	Token  string `json:"token"`
-	Role   string `json:"role"`
-	UserID string `json:"user_id"`
+	Token         string `json:"token"`
+	Role          string `json:"role"`
+	UserID        string `json:"user_id"`
+	InstitutionID string `json:"institution_id"`
+	SignupTicket  string `json:"signup_ticket"`
 }
 
 func setSessionCookie(c *gin.Context, token string, maxAge int) {
@@ -36,7 +36,7 @@ func HandleUserLogin(c *gin.Context, m Messenger) {
 	}
 	var response authResult
 	if err := callJSON(c.Request.Context(), m, "auth.request", map[string]interface{}{"type": "login", "username": req.Username, "password": req.Password}, &response); err != nil {
-		messagingError(c, err)
+		serviceError(c, err)
 		return
 	}
 	if response.Token == "" || response.Role == "" || response.UserID == "" {
@@ -46,6 +46,10 @@ func HandleUserLogin(c *gin.Context, m Messenger) {
 	setSessionCookie(c, response.Token, 24*60*60)
 	api.Success(c, http.StatusOK, gin.H{"role": response.Role, "user_id": response.UserID})
 }
+
+// HandleUserGoogleLogin signs in with a Google ID token obtained by the
+// client. Identity verifies the token itself; a registry student's first
+// sign-in returns signup_required and an HttpOnly signup ticket instead.
 func HandleUserGoogleLogin(c *gin.Context, m Messenger) {
 	var req struct {
 		Token string `json:"token" binding:"required"`
@@ -54,20 +58,16 @@ func HandleUserGoogleLogin(c *gin.Context, m Messenger) {
 		api.Failure(c, http.StatusBadRequest, api.CodeInvalidRequest, "A Google ID token is required", nil)
 		return
 	}
-	var identity struct {
-		Email string `json:"email"`
-	}
-	if err := callJSON(c.Request.Context(), m, "auth.login.google", map[string]interface{}{"token": req.Token}, &identity); err != nil {
-		messagingError(c, err)
-		return
-	}
-	if identity.Email == "" {
-		api.Failure(c, http.StatusBadGateway, api.CodeInvalidServiceReply, "Google authentication returned an invalid identity", nil)
-		return
-	}
 	var response authResult
-	if err := callJSON(c.Request.Context(), m, "auth.request", map[string]interface{}{"type": "google_login", "username": identity.Email}, &response); err != nil {
-		messagingError(c, err)
+	if err := callJSON(c.Request.Context(), m, "auth.request", map[string]any{"type": "google_token_login", "id_token": req.Token}, &response); err != nil {
+		serviceError(c, err)
+		return
+	}
+	if response.SignupTicket != "" {
+		secure := strings.EqualFold(os.Getenv("COOKIE_SECURE"), "true")
+		c.SetSameSite(http.SameSiteLaxMode)
+		c.SetCookie(googleSignupCookie, response.SignupTicket, 900, "/", "", secure, true)
+		api.Success(c, http.StatusOK, gin.H{"signup_required": true})
 		return
 	}
 	if response.Token == "" || response.Role == "" || response.UserID == "" {
@@ -93,7 +93,7 @@ func HandleUserChangePassword(c *gin.Context, m Messenger) {
 	}
 	var response map[string]interface{}
 	if err := callJSON(c.Request.Context(), m, "auth.request", map[string]interface{}{"type": "change_password", "username": username, "old_password": req.OldPassword, "new_password": req.NewPassword}, &response); err != nil {
-		messagingError(c, err)
+		serviceError(c, err)
 		return
 	}
 	api.Success(c, http.StatusOK, response)
@@ -102,10 +102,4 @@ func HandleUserChangePassword(c *gin.Context, m Messenger) {
 func HandleUserLogout(c *gin.Context) {
 	setSessionCookie(c, "", -1)
 	api.Success(c, http.StatusOK, gin.H{"message": "Logged out"})
-}
-func HandleUserCreated(d amqp.Delivery) {
-	log.Printf("[Orchestrator] user.created event received routing_key=%s", d.RoutingKey)
-	if err := d.Ack(false); err != nil {
-		log.Printf("[Orchestrator] failed to acknowledge user.created event: %v", err)
-	}
 }

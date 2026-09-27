@@ -1,22 +1,11 @@
-// student.js
+// student.js – grade review requests (SRS 2.8)
 import { request } from './_request.js';
 
-/**
- * Submit a new review request.
- * orchestrator: PATCH /student/reviewRequest
- */
-export const postReviewRequest = ({ course_id, exam_period, student_message }) =>
-  request('/student/reviewRequest', {
-    method : 'PATCH',
-    body   : { course_id, exam_period, student_message }
-  });
+export const postReviewRequest = ({ grading_id, message }) =>
+  request('/reviews', { method: 'POST', body: { grading_id, message } });
 
-/**
- * Check review status.
- * orchestrator: PATCH /student/status
- */
-export const getReviewStatus = ({ course_id, exam_period }) =>
-  request('/student/status', {
-    method : 'PATCH',
-    body   : { course_id, exam_period }
-  });
+/** The student's review requests with their status and replies. */
+export const getMyReviews = async () => {
+  const data = await request('/reviews/mine');
+  return Array.isArray(data) ? data : [];
+};

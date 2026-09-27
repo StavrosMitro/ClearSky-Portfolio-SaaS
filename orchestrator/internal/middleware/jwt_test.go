@@ -37,8 +37,9 @@ func TestJWTAuthMiddleware(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			now := time.Now()
 			claims := Claims{
-				UserID: "user-1",
-				Role:   tt.role,
+				UserID:        "user-1",
+				InstitutionID: "6f0b1a3e-0000-5000-8000-000000000001",
+				Role:          tt.role,
 				RegisteredClaims: jwt.RegisteredClaims{
 					Issuer:    tt.issuer,
 					Subject:   "user-1",
@@ -74,8 +75,9 @@ func TestJWTAuthMiddlewareAcceptsHTTPOnlyCookie(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
 	now := time.Now()
 	claims := Claims{
-		UserID: "user-1",
-		Role:   "student",
+		UserID:        "user-1",
+		InstitutionID: "6f0b1a3e-0000-5000-8000-000000000001",
+		Role:          "student",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer: "clearsky-identity", Subject: "user-1", Audience: jwt.ClaimStrings{"clearsky-api"},
 			ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)), IssuedAt: jwt.NewNumericDate(now), ID: "token-1",
